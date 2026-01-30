@@ -1,0 +1,33 @@
+"""Global dropdown API schemas (camelCase for frontend)."""
+
+from typing import List
+from uuid import UUID
+
+from pydantic import BaseModel, Field
+
+
+class SectionDropdownItem(BaseModel):
+    sectionName: str = Field(..., description="Section name (e.g. A, B, C)")
+    sectionId: UUID = Field(..., description="Section UUID")
+
+    class Config:
+        populate_by_name = True
+
+
+class ClassOnlyDropdownItem(BaseModel):
+    """Class only (indicator=C). No sections key in response."""
+    className: str = Field(..., description="Class name (e.g. 1st, 2nd)")
+    classId: UUID = Field(..., description="Class UUID")
+
+    class Config:
+        populate_by_name = True
+
+
+class ClassWithSectionsDropdownItem(BaseModel):
+    """Class with sections (indicator=CS)."""
+    className: str = Field(..., description="Class name (e.g. 1st, 2nd)")
+    classId: UUID = Field(..., description="Class UUID")
+    sections: List[SectionDropdownItem] = Field(..., description="Sections under this class")
+
+    class Config:
+        populate_by_name = True
