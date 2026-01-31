@@ -22,7 +22,7 @@ from app.auth.security import (
 )
 from app.auth.models import RefreshToken, User
 from app.core.exceptions import ServiceError
-from app.core.models import Tenant, TenantModule
+from app.core.models import Module, Tenant, TenantModule
 from app.core.tenant_service import generate_organization_code
 
 
@@ -54,9 +54,32 @@ async def register_tenant_and_admin(
         db.add(tenant)
         await db.flush()  # to populate tenant.id
 
-        # 5. Enable selected modules
+        # 5. Resolve selected_modules (module IDs) to valid module_keys
+        resolved_keys: List[str] = []
+        invalid_ids: List[str] = []
+        for module_id in payload.selected_modules:
+            mod = await db.get(Module, module_id)
+            if not mod or not mod.is_active:
+                invalid_ids.append(str(module_id))
+                continue
+            resolved_keys.append(mod.module_key)
+        if invalid_ids:
+            raise ServiceError(
+                f"Invalid or inactive module ID(s): {', '.join(invalid_ids)}. "
+                "Use module IDs from the modules list (e.g. from GET /api/v1/modules/by-organization-type).",
+                status.HTTP_400_BAD_REQUEST,
+            )
+        if not resolved_keys:
+            raise ServiceError(
+                "At least one valid module must be selected. Send module IDs from the modules list.",
+                status.HTTP_400_BAD_REQUEST,
+            )
+        # Deduplicate by module_key (same module selected twice)
+        resolved_keys = list(dict.fromkeys(resolved_keys))
+
+        # 6. Enable selected modules
         modules: List[TenantModule] = []
-        for module_key in payload.selected_modules:
+        for module_key in resolved_keys:
             module = TenantModule(
                 tenant_id=tenant.id,
                 module_key=module_key,
@@ -65,10 +88,10 @@ async def register_tenant_and_admin(
             db.add(module)
             modules.append(module)
 
-        # 6. Hash password
+        # 7. Hash password
         password_hash = hash_password(payload.password)
 
-        # 7. Create Super Admin user
+        # 8. Create Super Admin user
         admin_user = User(
             tenant_id=tenant.id,
             full_name=payload.admin_full_name,
@@ -81,7 +104,7 @@ async def register_tenant_and_admin(
         )
         db.add(admin_user)
 
-        # NOTE: 8. Trial subscription bootstrap could be added here when subscription model exists.
+        # NOTE: Trial subscription bootstrap could be added here when subscription model exists.
 
         await db.commit()
         await db.refresh(tenant)

@@ -14,7 +14,7 @@ class RegisterRequest(BaseModel):
     timezone: str
     org_short_code: Optional[str] = Field(None, max_length=10)  # Optional; e.g. "KTS", "SSHS". For identification only.
 
-    selected_modules: List[str] = Field(..., min_items=1)
+    selected_modules: List[UUID] = Field(..., min_length=1, description="List of module IDs (UUID) from core.modules")
 
     admin_full_name: str
     admin_email: EmailStr
