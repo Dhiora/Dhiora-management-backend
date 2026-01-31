@@ -496,6 +496,100 @@ STUDENT_ATTENDANCE_TABLE: str = """
     );
 """
 
+# ----- Homework Management -----
+HOMEWORKS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.homeworks (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        teacher_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+        title VARCHAR(255) NOT NULL,
+        description TEXT,
+        status VARCHAR(20) NOT NULL DEFAULT 'DRAFT',
+        time_mode VARCHAR(20) NOT NULL DEFAULT 'NO_TIME',
+        total_time_minutes INTEGER,
+        per_question_time_seconds INTEGER,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT chk_homework_status CHECK (status IN ('DRAFT', 'PUBLISHED', 'ARCHIVED')),
+        CONSTRAINT chk_homework_time_mode CHECK (time_mode IN ('NO_TIME', 'TOTAL_TIME', 'PER_QUESTION'))
+    );
+"""
+
+HOMEWORK_QUESTIONS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.homework_questions (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        homework_id UUID NOT NULL REFERENCES school.homeworks(id) ON DELETE CASCADE,
+        question_text TEXT NOT NULL,
+        question_type VARCHAR(20) NOT NULL,
+        options JSONB,
+        correct_answer JSONB,
+        hints JSONB NOT NULL DEFAULT '[]',
+        display_order INTEGER NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT chk_question_type CHECK (question_type IN ('MCQ', 'FILL_IN_BLANK', 'SHORT_ANSWER', 'LONG_ANSWER', 'MULTI_CHECK'))
+    );
+"""
+
+# Alter existing homework_questions to support new question types (if table exists with old constraint)
+ALTER_HOMEWORK_QUESTIONS_QUESTION_TYPES: str = """
+    DO $$
+    BEGIN
+        IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='school' AND table_name='homework_questions') THEN
+            ALTER TABLE school.homework_questions DROP CONSTRAINT IF EXISTS chk_question_type;
+            ALTER TABLE school.homework_questions ADD CONSTRAINT chk_question_type CHECK (question_type IN ('MCQ', 'FILL_IN_BLANK', 'SHORT_ANSWER', 'LONG_ANSWER', 'MULTI_CHECK'));
+        END IF;
+    EXCEPTION
+        WHEN others THEN NULL;  -- Ignore if constraint already correct
+    END $$;
+"""
+
+HOMEWORK_ASSIGNMENTS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.homework_assignments (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        homework_id UUID NOT NULL REFERENCES school.homeworks(id) ON DELETE CASCADE,
+        academic_year_id UUID NOT NULL REFERENCES core.academic_years(id) ON DELETE RESTRICT,
+        class_id UUID NOT NULL REFERENCES core.classes(id),
+        section_id UUID REFERENCES core.sections(id),
+        due_date TIMESTAMPTZ NOT NULL,
+        assigned_by UUID NOT NULL REFERENCES auth.users(id) ON DELETE RESTRICT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+"""
+
+HOMEWORK_ATTEMPTS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.homework_attempts (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        homework_assignment_id UUID NOT NULL REFERENCES school.homework_assignments(id) ON DELETE CASCADE,
+        student_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+        attempt_number INTEGER NOT NULL DEFAULT 1,
+        restart_reason TEXT,
+        started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        completed_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+"""
+
+HOMEWORK_SUBMISSIONS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.homework_submissions (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        homework_assignment_id UUID NOT NULL REFERENCES school.homework_assignments(id) ON DELETE CASCADE,
+        student_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+        attempt_id UUID NOT NULL REFERENCES school.homework_attempts(id) ON DELETE CASCADE,
+        answers JSONB NOT NULL DEFAULT '{}',
+        submitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_submission_per_attempt UNIQUE (attempt_id)
+    );
+"""
+
+HOMEWORK_HINT_USAGE_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.homework_hint_usage (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        homework_question_id UUID NOT NULL REFERENCES school.homework_questions(id) ON DELETE CASCADE,
+        homework_attempt_id UUID NOT NULL REFERENCES school.homework_attempts(id) ON DELETE CASCADE,
+        student_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+        hint_index INTEGER NOT NULL,
+        viewed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+"""
+
 # hrms.employee_attendance - one per employee per day
 EMPLOYEE_ATTENDANCE_TABLE: str = """
     CREATE TABLE IF NOT EXISTS hrms.employee_attendance (
@@ -586,6 +680,13 @@ async def ensure_tables(db_engine: AsyncEngine) -> None:
         await conn.execute(text(TEACHER_CLASS_ASSIGNMENTS_TABLE))
         await conn.execute(text(STUDENT_ATTENDANCE_TABLE))
         await conn.execute(text(EMPLOYEE_ATTENDANCE_TABLE))
+        await conn.execute(text(HOMEWORKS_TABLE))
+        await conn.execute(text(HOMEWORK_QUESTIONS_TABLE))
+        await conn.execute(text(ALTER_HOMEWORK_QUESTIONS_QUESTION_TYPES))
+        await conn.execute(text(HOMEWORK_ASSIGNMENTS_TABLE))
+        await conn.execute(text(HOMEWORK_ATTEMPTS_TABLE))
+        await conn.execute(text(HOMEWORK_SUBMISSIONS_TABLE))
+        await conn.execute(text(HOMEWORK_HINT_USAGE_TABLE))
 
     # Backfill student_academic_records from existing student_profiles (class_id, section_id)
     # Idempotent: only inserts if no record exists for (student_id, current_academic_year_id)

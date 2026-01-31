@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1.academic_years.router import router as academic_years_router
 from app.api.v1.attendance.router import router as attendance_router
+from app.api.v1.homework.router import router as homework_router
 from app.api.v1.auth.router import router as auth_router
 from app.api.v1.auth.roles_router import router as roles_router
 from app.api.v1.classes.classes_router import router as classes_router
@@ -33,6 +34,7 @@ def create_app() -> FastAPI:
     app.include_router(roles_router)
     app.include_router(academic_years_router)
     app.include_router(attendance_router)
+    app.include_router(homework_router)
     app.include_router(departments_router)
     app.include_router(classes_router)
     app.include_router(sections_router)

@@ -1,0 +1,1 @@
+"""Homework Management API."""
