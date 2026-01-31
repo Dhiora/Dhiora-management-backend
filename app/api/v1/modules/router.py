@@ -1,10 +1,24 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi import status as http_status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth.rbac import require_platform_admin
 from app.core.enums import OrganizationType
-from app.core.schemas import ModulesByOrganizationTypeResponse
-from app.core.services import ServiceError, get_modules_by_organization_type
+from app.core.schemas import (
+    ModulesByOrganizationTypeResponse,
+    OrganizationTypeModuleCreate,
+    OrganizationTypeModuleResponse,
+    OrganizationTypeModuleUpdate,
+)
+from app.core.services import (
+    ServiceError,
+    create_organization_type_module,
+    delete_organization_type_module,
+    get_modules_by_organization_type,
+    update_organization_type_module,
+)
 from app.db.session import get_db
 
 router = APIRouter(prefix="/api/v1/modules", tags=["modules"])
@@ -15,8 +29,58 @@ async def get_modules(
     organization_type: OrganizationType,
     db: AsyncSession = Depends(get_db),
 ) -> ModulesByOrganizationTypeResponse:
-    """Get all modules for an organization type (HRMS + org-specific)."""
+    """Get all modules for an organization type (HRMS + org-specific). No authentication required."""
     try:
         return await get_modules_by_organization_type(db, organization_type.value)
+    except ServiceError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+
+
+@router.post(
+    "/by-organization-type",
+    response_model=OrganizationTypeModuleResponse,
+    status_code=http_status.HTTP_201_CREATED,
+    dependencies=[Depends(require_platform_admin)],
+)
+async def create_organization_type_module_mapping(
+    payload: OrganizationTypeModuleCreate,
+    db: AsyncSession = Depends(get_db),
+) -> OrganizationTypeModuleResponse:
+    """Create a module-to-organization-type mapping. Platform Admin only."""
+    try:
+        return await create_organization_type_module(db, payload)
+    except ServiceError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+
+
+@router.put(
+    "/by-organization-type/{mapping_id}",
+    response_model=OrganizationTypeModuleResponse,
+    dependencies=[Depends(require_platform_admin)],
+)
+async def update_organization_type_module_mapping(
+    mapping_id: UUID,
+    payload: OrganizationTypeModuleUpdate,
+    db: AsyncSession = Depends(get_db),
+) -> OrganizationTypeModuleResponse:
+    """Update is_default/is_enabled for a mapping. Platform Admin only."""
+    try:
+        return await update_organization_type_module(db, mapping_id, payload)
+    except ServiceError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+
+
+@router.delete(
+    "/by-organization-type/{mapping_id}",
+    status_code=http_status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_platform_admin)],
+)
+async def delete_organization_type_module_mapping(
+    mapping_id: UUID,
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Delete a module-to-organization-type mapping. Platform Admin only."""
+    try:
+        await delete_organization_type_module(db, mapping_id)
     except ServiceError as e:
         raise HTTPException(status_code=e.status_code, detail=e.message)

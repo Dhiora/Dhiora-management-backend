@@ -1,7 +1,7 @@
 from typing import List
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,6 +15,9 @@ from app.api.v1.query import service as query_service
 from app.api.v1.query.schemas import ResourceQueryRequest
 
 from .schemas import (
+    StudentPromote,
+    StudentBulkPromote,
+    StudentBulkPromoteResult,
     StudentBulkCreate,
     StudentBulkFailureItem,
     StudentBulkItem,
@@ -217,6 +220,46 @@ async def get_student(
     if not student:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
     return student
+
+
+@router.post(
+    "/promote-bulk",
+    response_model=StudentBulkPromoteResult,
+    dependencies=[Depends(check_permission("students", "update"))],
+)
+async def promote_students_bulk(
+    payload: StudentBulkPromote,
+    preview: bool = Query(False, description="If true, return actions without committing"),
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+) -> StudentBulkPromoteResult:
+    """
+    Promote students from source to target academic year.
+    RETAIN=same class/section; PROMOTE=new class/section.
+    Use ?preview=true to see actions without committing.
+    """
+    try:
+        return await service.promote_students_bulk(db, current_user.tenant_id, payload, preview=preview)
+    except ServiceError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+
+
+@router.post(
+    "/{user_id}/promote",
+    response_model=StudentResponse,
+    dependencies=[Depends(check_permission("students", "update"))],
+)
+async def promote_student(
+    user_id: UUID,
+    payload: StudentPromote,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+) -> StudentResponse:
+    """Promote student to new academic year. Old record → PROMOTED; creates new record (promotion-safe)."""
+    try:
+        return await service.promote_student(db, current_user.tenant_id, user_id, payload)
+    except ServiceError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
 
 
 @router.put(

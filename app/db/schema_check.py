@@ -10,12 +10,15 @@ from app.db.session import engine
 
 REQUIRED_TABLES: List[Tuple[str, str]] = [
     ("core", "tenants"),
+    ("core", "academic_years"),
     ("core", "departments"),
+    ("school", "student_academic_records"),
     ("core", "classes"),
     ("core", "sections"),
     ("core", "tenant_modules"),
     ("core", "modules"),
     ("core", "organization_type_modules"),
+    ("core", "subscription_plans"),
     ("auth", "users"),
     ("auth", "refresh_tokens"),
     ("auth", "roles"),
@@ -27,6 +30,8 @@ REQUIRED_TABLES: List[Tuple[str, str]] = [
 CREATE_SCHEMA_SQL: Dict[str, str] = {
     "core": "CREATE SCHEMA IF NOT EXISTS core;",
     "auth": "CREATE SCHEMA IF NOT EXISTS auth;",
+    "school": "CREATE SCHEMA IF NOT EXISTS school;",
+    "hrms": "CREATE SCHEMA IF NOT EXISTS hrms;",
 }
 
 
@@ -38,6 +43,7 @@ CREATE_TABLE_SQL: Dict[Tuple[str, str], str] = {
             module_name VARCHAR(255) NOT NULL,
             module_domain VARCHAR(50) NOT NULL,
             description TEXT,
+            price VARCHAR(100) NOT NULL DEFAULT '0',
             is_active BOOLEAN NOT NULL DEFAULT TRUE,
             created_at TIMESTAMPTZ NOT NULL
         );
@@ -53,6 +59,24 @@ CREATE_TABLE_SQL: Dict[Tuple[str, str], str] = {
             timezone VARCHAR(100) NOT NULL,
             status VARCHAR(20) NOT NULL,
             created_at TIMESTAMPTZ NOT NULL
+        );
+    """,
+    ("core", "academic_years"): """
+        CREATE TABLE IF NOT EXISTS core.academic_years (
+            id UUID PRIMARY KEY,
+            tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+            name VARCHAR(50) NOT NULL,
+            start_date DATE NOT NULL,
+            end_date DATE NOT NULL,
+            is_current BOOLEAN NOT NULL DEFAULT FALSE,
+            status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
+            admissions_allowed BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            closed_at TIMESTAMPTZ,
+            closed_by UUID,
+            CONSTRAINT uq_academic_year_tenant_name UNIQUE (tenant_id, name),
+            CONSTRAINT chk_academic_year_dates CHECK (end_date > start_date)
         );
     """,
     ("core", "departments"): """
@@ -114,6 +138,20 @@ CREATE_TABLE_SQL: Dict[Tuple[str, str], str] = {
             CONSTRAINT uq_org_type_module UNIQUE (organization_type, module_key)
         );
     """,
+    ("core", "subscription_plans"): """
+        CREATE TABLE IF NOT EXISTS core.subscription_plans (
+            id UUID PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            organization_type VARCHAR(100) NOT NULL,
+            modules_include JSONB NOT NULL DEFAULT '[]',
+            price VARCHAR(100) NOT NULL DEFAULT '',
+            discount_price VARCHAR(100),
+            description TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT uq_subscription_plan_name_org_type UNIQUE (name, organization_type)
+        );
+    """,
     ("auth", "users"): """
         CREATE TABLE IF NOT EXISTS auth.users (
             id UUID PRIMARY KEY,
@@ -153,10 +191,8 @@ CREATE_TABLE_SQL: Dict[Tuple[str, str], str] = {
         CREATE TABLE IF NOT EXISTS auth.staff_profiles (
             id UUID PRIMARY KEY,
             user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
-            employee_number VARCHAR(50),
             employee_code VARCHAR(50),
             department_id UUID REFERENCES core.departments(id),
-            department VARCHAR(100),
             designation VARCHAR(100),
             join_date DATE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -168,10 +204,6 @@ CREATE_TABLE_SQL: Dict[Tuple[str, str], str] = {
             id UUID PRIMARY KEY,
             user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
             roll_number VARCHAR(50),
-            class_id UUID REFERENCES core.classes(id),
-            section_id UUID REFERENCES core.sections(id),
-            class VARCHAR(50),
-            section VARCHAR(50),
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             CONSTRAINT uq_student_profile_user UNIQUE (user_id)
         );
@@ -249,7 +281,7 @@ ALTER_TENANTS_ORG_SHORT_CODE: str = """
     END $$;
 """
 
-# Add employee_code to staff_profiles (auto-generated employee number; identification only)
+# Add employee_code to staff_profiles (auto-generated employee code; identification only)
 ALTER_STAFF_PROFILES_EMPLOYEE_CODE: str = """
     DO $$
     BEGIN
@@ -323,6 +355,174 @@ ALTER_SECTIONS_ADD_CLASS_NAME_UNIQUE: str = """
     END $$;
 """
 
+# Add price column to core.modules (for existing DBs)
+ALTER_MODULES_PRICE: str = """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'core' AND table_name = 'modules' AND column_name = 'price'
+        ) THEN
+            ALTER TABLE core.modules ADD COLUMN price VARCHAR(100) NOT NULL DEFAULT '0';
+        END IF;
+    END $$;
+"""
+
+# Random prices for backfilling existing modules (will be updated later)
+MODULE_BACKFILL_PRICES: tuple = (
+    "9", "19", "29", "49", "79", "99", "129", "199", "49", "79", "29", "99",
+    "59", "39", "149", "69", "89", "109", "19", "249",
+)
+
+# Add organization_type to core.subscription_plans (for existing DBs)
+ALTER_SUBSCRIPTION_PLANS_ORGANIZATION_TYPE: str = """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'core' AND table_name = 'subscription_plans' AND column_name = 'organization_type'
+        ) THEN
+            ALTER TABLE core.subscription_plans ADD COLUMN organization_type VARCHAR(100) NOT NULL DEFAULT 'School';
+        END IF;
+    END $$;
+"""
+ALTER_SUBSCRIPTION_PLANS_DROP_OLD_UNIQUE: str = """
+    ALTER TABLE core.subscription_plans DROP CONSTRAINT IF EXISTS subscription_plans_name_key;
+"""
+ALTER_SUBSCRIPTION_PLANS_ADD_NAME_ORG_UNIQUE: str = """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint c
+            JOIN pg_class t ON c.conrelid = t.oid
+            JOIN pg_namespace n ON t.relnamespace = n.oid
+            WHERE n.nspname = 'core' AND t.relname = 'subscription_plans' AND c.conname = 'uq_subscription_plan_name_org_type'
+        ) THEN
+            ALTER TABLE core.subscription_plans ADD CONSTRAINT uq_subscription_plan_name_org_type UNIQUE (name, organization_type);
+        END IF;
+    EXCEPTION
+        WHEN duplicate_object THEN NULL;
+    END $$;
+"""
+
+# Only one academic year per tenant can have is_current = true
+CREATE_INDEX_ACADEMIC_YEAR_CURRENT: str = """
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_tenant_current_academic_year
+    ON core.academic_years (tenant_id) WHERE (is_current = true);
+"""
+
+# Add admissions_allowed, closed_at, closed_by to core.academic_years (for existing DBs)
+ALTER_ACADEMIC_YEARS_EXTRA: str = """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'core' AND table_name = 'academic_years' AND column_name = 'admissions_allowed'
+        ) THEN
+            ALTER TABLE core.academic_years ADD COLUMN admissions_allowed BOOLEAN NOT NULL DEFAULT TRUE;
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'core' AND table_name = 'academic_years' AND column_name = 'closed_at'
+        ) THEN
+            ALTER TABLE core.academic_years ADD COLUMN closed_at TIMESTAMPTZ;
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'core' AND table_name = 'academic_years' AND column_name = 'closed_by'
+        ) THEN
+            ALTER TABLE core.academic_years ADD COLUMN closed_by UUID;
+        END IF;
+    END $$;
+"""
+# Add FK for closed_by (runs after auth.users exists)
+ALTER_ACADEMIC_YEARS_CLOSED_BY_FK: str = """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint c
+            JOIN pg_class t ON c.conrelid = t.oid
+            JOIN pg_namespace n ON t.relnamespace = n.oid
+            WHERE n.nspname = 'core' AND t.relname = 'academic_years' AND c.conname = 'fk_academic_years_closed_by'
+        ) THEN
+            ALTER TABLE core.academic_years ADD CONSTRAINT fk_academic_years_closed_by
+            FOREIGN KEY (closed_by) REFERENCES auth.users(id) ON DELETE SET NULL;
+        END IF;
+    EXCEPTION
+        WHEN others THEN NULL;
+    END $$;
+"""
+
+# school.student_academic_records - student per academic year (promotion-safe)
+STUDENT_ACADEMIC_RECORDS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.student_academic_records (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        student_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+        academic_year_id UUID NOT NULL REFERENCES core.academic_years(id) ON DELETE RESTRICT,
+        class_id UUID NOT NULL REFERENCES core.classes(id),
+        section_id UUID NOT NULL REFERENCES core.sections(id),
+        roll_number VARCHAR(50),
+        status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_student_academic_year UNIQUE (student_id, academic_year_id)
+    );
+"""
+
+# school.teacher_class_assignments - which teacher teaches which class-section (for attendance scope)
+TEACHER_CLASS_ASSIGNMENTS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.teacher_class_assignments (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        teacher_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+        class_id UUID NOT NULL REFERENCES core.classes(id),
+        section_id UUID NOT NULL REFERENCES core.sections(id),
+        academic_year_id UUID NOT NULL REFERENCES core.academic_years(id) ON DELETE CASCADE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_teacher_class_section_year UNIQUE (teacher_id, class_id, section_id, academic_year_id)
+    );
+"""
+
+# school.student_attendance - one per student per day per academic year
+STUDENT_ATTENDANCE_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.student_attendance (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        student_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+        academic_year_id UUID NOT NULL REFERENCES core.academic_years(id) ON DELETE RESTRICT,
+        date DATE NOT NULL,
+        status VARCHAR(20) NOT NULL,
+        marked_by UUID NOT NULL REFERENCES auth.users(id) ON DELETE RESTRICT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_student_attendance_day UNIQUE (student_id, academic_year_id, date),
+        CONSTRAINT chk_student_attendance_status CHECK (status IN ('PRESENT', 'ABSENT', 'LATE', 'HALF_DAY'))
+    );
+"""
+
+# hrms.employee_attendance - one per employee per day
+EMPLOYEE_ATTENDANCE_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS hrms.employee_attendance (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        employee_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+        date DATE NOT NULL,
+        status VARCHAR(20) NOT NULL,
+        marked_by UUID NOT NULL REFERENCES auth.users(id) ON DELETE RESTRICT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_employee_attendance_day UNIQUE (employee_id, date),
+        CONSTRAINT chk_employee_attendance_status CHECK (status IN ('PRESENT', 'ABSENT', 'LATE', 'HALF_DAY', 'LEAVE'))
+    );
+"""
+
+# Drop class_id, section_id from student_profiles (after backfill)
+ALTER_STUDENT_PROFILES_DROP_CLASS_SECTION: str = """
+    DO $$
+    BEGIN
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='auth' AND table_name='student_profiles' AND column_name='class_id') THEN
+            ALTER TABLE auth.student_profiles DROP COLUMN class_id;
+        END IF;
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='auth' AND table_name='student_profiles' AND column_name='section_id') THEN
+            ALTER TABLE auth.student_profiles DROP COLUMN section_id;
+        END IF;
+    END $$;
+"""
+
 
 async def ensure_tables(db_engine: AsyncEngine) -> None:
     """
@@ -338,12 +538,14 @@ async def ensure_tables(db_engine: AsyncEngine) -> None:
         missing: List[str] = []
         order_tables: List[Tuple[str, str]] = [
             ("core", "tenants"),
+            ("core", "academic_years"),
             ("core", "departments"),
             ("core", "classes"),
             ("core", "sections"),
             ("core", "tenant_modules"),
             ("core", "modules"),
             ("core", "organization_type_modules"),
+            ("core", "subscription_plans"),
             ("auth", "roles"),
             ("auth", "users"),
             ("auth", "refresh_tokens"),
@@ -373,7 +575,83 @@ async def ensure_tables(db_engine: AsyncEngine) -> None:
         await conn.execute(text(ALTER_SECTIONS_CLASS_ID))
         await conn.execute(text(ALTER_SECTIONS_DROP_OLD_UNIQUE))
         await conn.execute(text(ALTER_SECTIONS_ADD_CLASS_NAME_UNIQUE))
+        await conn.execute(text(ALTER_MODULES_PRICE))
+        await conn.execute(text(ALTER_SUBSCRIPTION_PLANS_ORGANIZATION_TYPE))
+        await conn.execute(text(ALTER_SUBSCRIPTION_PLANS_DROP_OLD_UNIQUE))
+        await conn.execute(text(ALTER_SUBSCRIPTION_PLANS_ADD_NAME_ORG_UNIQUE))
+        await conn.execute(text(CREATE_INDEX_ACADEMIC_YEAR_CURRENT))
+        await conn.execute(text(ALTER_ACADEMIC_YEARS_EXTRA))
+        await conn.execute(text(ALTER_ACADEMIC_YEARS_CLOSED_BY_FK))
+        await conn.execute(text(STUDENT_ACADEMIC_RECORDS_TABLE))
+        await conn.execute(text(TEACHER_CLASS_ASSIGNMENTS_TABLE))
+        await conn.execute(text(STUDENT_ATTENDANCE_TABLE))
+        await conn.execute(text(EMPLOYEE_ATTENDANCE_TABLE))
 
+    # Backfill student_academic_records from existing student_profiles (class_id, section_id)
+    # Idempotent: only inserts if no record exists for (student_id, current_academic_year_id)
+    async with db_engine.connect() as sar_conn:
+        ay_result = await sar_conn.execute(
+            text("SELECT id, tenant_id FROM core.academic_years WHERE is_current = true AND status = 'ACTIVE'")
+        )
+        for ay_row in ay_result.mappings().all():
+            ay_id, tenant_id = ay_row["id"], ay_row["tenant_id"]
+            sp_result = await sar_conn.execute(
+                text("""
+                    SELECT sp.user_id, sp.class_id, sp.section_id, sp.roll_number
+                    FROM auth.student_profiles sp
+                    JOIN auth.users u ON u.id = sp.user_id
+                    WHERE u.tenant_id = :tid
+                      AND sp.class_id IS NOT NULL
+                      AND sp.section_id IS NOT NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM school.student_academic_records sar
+                          WHERE sar.student_id = sp.user_id AND sar.academic_year_id = :ayid
+                      )
+                """),
+                {"tid": tenant_id, "ayid": ay_id},
+            )
+            for sp_row in sp_result.mappings().all():
+                await sar_conn.execute(
+                    text("""
+                        INSERT INTO school.student_academic_records (student_id, academic_year_id, class_id, section_id, roll_number, status)
+                        VALUES (:sid, :ayid, :cid, :secid, :roll, 'ACTIVE')
+                        ON CONFLICT (student_id, academic_year_id) DO NOTHING
+                    """),
+                    {
+                        "sid": sp_row["user_id"],
+                        "ayid": ay_id,
+                        "cid": sp_row["class_id"],
+                        "secid": sp_row["section_id"],
+                        "roll": sp_row["roll_number"] or "",
+                    },
+                )
+            await sar_conn.commit()
+        await sar_conn.execute(text(ALTER_STUDENT_PROFILES_DROP_CLASS_SECTION))
+        await sar_conn.commit()
+
+    # Backfill module prices (assign random placeholder costs to modules with price='0')
+    async with db_engine.connect() as module_conn:
+        module_result = await module_conn.execute(
+            text("SELECT id, module_key FROM core.modules WHERE price IS NULL OR price = '' OR price = '0'")
+        )
+        module_rows = module_result.mappings().all()
+        for i, row in enumerate(module_rows):
+            price = MODULE_BACKFILL_PRICES[i % len(MODULE_BACKFILL_PRICES)]
+            await module_conn.execute(
+                text("UPDATE core.modules SET price = :price WHERE id = :id"),
+                {"price": price, "id": row["id"]},
+            )
+            await module_conn.commit()
+    # Backfill subscription_plans: set organization_type = 'School' for existing plans with NULL or empty
+    async with db_engine.connect() as sub_conn:
+        await sub_conn.execute(
+            text("""
+                UPDATE core.subscription_plans
+                SET organization_type = 'School'
+                WHERE organization_type IS NULL OR organization_type = ''
+            """)
+        )
+        await sub_conn.commit()
     # Backfill organization_code for existing tenants (requires Python loop; run outside begin if needed)
     async with db_engine.connect() as backfill_conn:
         result = await backfill_conn.execute(

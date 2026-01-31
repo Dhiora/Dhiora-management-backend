@@ -27,6 +27,8 @@ class Module(Base):
     # Domain of the module, e.g. 'HRMS' or 'SCHOOL'
     module_domain = Column(String(50), nullable=False)
     description = Column(Text, nullable=True)
+    # Price for the module (e.g. "29", "$99/mo", "Free")
+    price = Column(String(100), nullable=False, default="0")
     is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
 

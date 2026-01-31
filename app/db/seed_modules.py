@@ -55,6 +55,8 @@ SCHOOL_MODULES: List[Tuple[str, str, str, str]] = [
 ]
 
 ORGANIZATION_TYPE = "School"
+# Placeholder prices for new modules (cycled; update later)
+SEED_PRICES = ("9", "19", "29", "49", "79", "99", "129", "199", "59", "39")
 
 
 async def seed_modules(db: AsyncSession) -> None:
@@ -65,18 +67,21 @@ async def seed_modules(db: AsyncSession) -> None:
     modules_created = 0
     modules_updated = 0
 
-    for module_key, module_name, module_domain, description in all_modules:
+    for i, (module_key, module_name, module_domain, description) in enumerate(all_modules):
         # Check if module already exists
         stmt = select(Module).where(Module.module_key == module_key)
         result = await db.execute(stmt)
         existing_module = result.scalar_one_or_none()
+        price = SEED_PRICES[i % len(SEED_PRICES)]
 
         if existing_module:
-            # Update existing module
+            # Update existing module (set price only if still default)
             existing_module.module_name = module_name
             existing_module.module_domain = module_domain
             existing_module.description = description
             existing_module.is_active = True
+            if getattr(existing_module, "price", None) in (None, "", "0"):
+                existing_module.price = price
             modules_updated += 1
         else:
             # Create new module
@@ -85,6 +90,7 @@ async def seed_modules(db: AsyncSession) -> None:
                 module_name=module_name,
                 module_domain=module_domain,
                 description=description,
+                price=price,
                 is_active=True,
             )
             db.add(new_module)

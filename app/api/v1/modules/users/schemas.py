@@ -7,7 +7,7 @@ from pydantic import BaseModel, EmailStr, Field
 
 # ----- Staff profile -----
 class StaffProfileBase(BaseModel):
-    employee_number: Optional[str] = None
+    employee_code: Optional[str] = None
     department_id: Optional[UUID] = None
     designation: Optional[str] = None
     join_date: Optional[date] = None
@@ -18,7 +18,6 @@ class StaffProfileCreate(StaffProfileBase):
 
 
 class StaffProfileUpdate(BaseModel):
-    employee_number: Optional[str] = None
     department_id: Optional[UUID] = None
     designation: Optional[str] = None
     join_date: Optional[date] = None
@@ -59,7 +58,7 @@ class StudentProfileResponse(StudentProfileBase):
 
 # ----- Employee -----
 class EmployeeCreate(BaseModel):
-    """Do NOT send user_type, tenant_id, or employee_number (generated in backend). department_id is required."""
+    """Do NOT send user_type, tenant_id, or employee_code (generated in backend). department_id is required."""
 
     full_name: str = Field(..., min_length=1)
     email: EmailStr
@@ -81,7 +80,7 @@ class EmployeeUpdate(BaseModel):
     department_id: Optional[UUID] = None  # Must be active department for tenant if provided
     designation: Optional[str] = None
     join_date: Optional[date] = None
-    # employee_number/employee_code are NOT editable after creation
+    # employee_code is NOT editable after creation
 
 
 class EmployeeResponse(BaseModel):
@@ -113,6 +112,78 @@ class StudentCreate(BaseModel):
     class_id: UUID  # Required; must be active class for tenant
     section_id: UUID  # Required; must be active section for tenant
     role_id: Optional[UUID] = Field(None, description="Tenant role to assign (e.g. STUDENT1, STUDENT2). If omitted, default 'STUDENT' role is used.")
+
+
+class StudentPromote(BaseModel):
+    """Promote student to new academic year. Creates new academic record; old record status → PROMOTED."""
+
+    academic_year_id: UUID = Field(..., description="New academic year to promote to")
+    class_id: UUID = Field(..., description="New class for the promoted year")
+    section_id: UUID = Field(..., description="New section for the promoted year")
+    roll_number: Optional[str] = None
+
+
+class DefaultClassPromotion(BaseModel):
+    """Maps from_class → to_class for default promotion."""
+
+    from_class_id: UUID = Field(..., description="Current class of students")
+    to_class_id: UUID = Field(..., description="Target class after promotion")
+
+
+class StudentPromotionOverride(BaseModel):
+    """Per-student override: RETAIN (same class) or PROMOTE (new class/section)."""
+
+    student_id: UUID = Field(..., description="Student to override")
+    action: str = Field(..., description="RETAIN or PROMOTE")
+    to_class_id: Optional[UUID] = Field(None, description="Target class (required if action=PROMOTE)")
+    to_section_id: Optional[UUID] = Field(None, description="Target section (required if action=PROMOTE with section)")
+
+
+class StudentBulkPromote(BaseModel):
+    """Bulk promote students from source to target academic year."""
+
+    source_academic_year_id: UUID = Field(..., description="Academic year to promote from")
+    target_academic_year_id: UUID = Field(..., description="Academic year to promote to (must be ACTIVE)")
+    default_class_promotion: List[DefaultClassPromotion] = Field(
+        default_factory=list,
+        description="Class mapping: from_class → to_class",
+    )
+    default_section_behavior: str = Field(
+        "AUTO",
+        description="AUTO=assign first section; SAME=keep same section name; MANUAL=fail unless in overrides",
+    )
+    student_overrides: List[StudentPromotionOverride] = Field(
+        default_factory=list,
+        description="Per-student: RETAIN=same class/section; PROMOTE=use to_class_id, to_section_id",
+    )
+
+
+class PromotionAction(BaseModel):
+    """Single promotion action for preview/result."""
+
+    student_id: UUID
+    full_name: str
+    action: str = Field(..., description="PROMOTED, RETAINED, or SKIPPED")
+    from_class_id: Optional[UUID] = None
+    from_section_id: Optional[UUID] = None
+    to_class_id: Optional[UUID] = None
+    to_section_id: Optional[UUID] = None
+    reason: Optional[str] = None
+
+
+class StudentBulkPromoteResult(BaseModel):
+    """Result of bulk promotion."""
+
+    promoted_count: int = Field(..., description="Number of students promoted/retained")
+    promoted_ids: List[UUID] = Field(default_factory=list)
+    skipped: List[dict] = Field(
+        default_factory=list,
+        description="Students skipped: {student_id, full_name, reason}",
+    )
+    actions: Optional[List[PromotionAction]] = Field(
+        None,
+        description="Per-student actions (included when preview=true)",
+    )
 
 
 class StudentUpdate(BaseModel):

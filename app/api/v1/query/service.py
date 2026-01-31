@@ -12,7 +12,7 @@ from app.api.v1.classes.schemas import ClassResponse
 from app.api.v1.sections.schemas import SectionResponse
 from app.api.v1.modules.users import service as user_service
 from app.auth.models import StaffProfile, StudentProfile, User
-from app.core.models import Department, SchoolClass, Section
+from app.core.models import AcademicYear, Department, SchoolClass, Section, StudentAcademicRecord
 
 from .schemas import FilterItem, FilterOperator, PaginatedResponse, SortDirection, SortItem
 
@@ -100,7 +100,10 @@ def _get_column_for_resource(resource_type: str, field: str, allowed: Set[str]):
         user_fields = {"full_name", "email", "mobile", "status", "created_at"}
         if field in user_fields:
             return getattr(User, field, None)
-        return getattr(StudentProfile, field, None)  # roll_number, class_id, section_id
+        # roll_number, class_id, section_id come from StudentAcademicRecord (current year)
+        if field in ("roll_number", "class_id", "section_id"):
+            return getattr(StudentAcademicRecord, field, None)
+        return getattr(StudentProfile, field, None)
     return None
 
 
@@ -120,10 +123,18 @@ def _build_base_stmt(resource_type: str, tenant_id: UUID):
             .options(selectinload(User.staff_profile))
         )
     if resource_type == "students":
+        # Join student_academic_records for current year (is_current=true) to filter/sort by class, section
         return (
             select(User)
             .join(StudentProfile, User.id == StudentProfile.user_id)
-            .where(User.tenant_id == tenant_id, User.user_type == "student")
+            .join(StudentAcademicRecord, User.id == StudentAcademicRecord.student_id)
+            .join(AcademicYear, StudentAcademicRecord.academic_year_id == AcademicYear.id)
+            .where(
+                User.tenant_id == tenant_id,
+                User.user_type == "student",
+                AcademicYear.tenant_id == tenant_id,
+                AcademicYear.is_current.is_(True),
+            )
             .options(selectinload(User.student_profile))
         )
     return None
@@ -169,7 +180,8 @@ def _row_to_item(resource_type: str, row: Any) -> Dict[str, Any]:
     if resource_type == "employees":
         return user_service._user_to_employee_response(row).model_dump()
     if resource_type == "students":
-        return user_service._user_to_student_response(row).model_dump()
+        # Students require async _user_to_student_response; handled in run_query
+        return {}
     return {}
 
 
@@ -300,7 +312,13 @@ async def run_global_query(
     result = await db.execute(stmt)
     rows = result.scalars().all()
 
-    items = [_row_to_item(resource_type, row) for row in rows]
+    if resource_type == "students":
+        items = []
+        for row in rows:
+            resp = await user_service._user_to_student_response(db, row, tenant_id)
+            items.append(resp.model_dump())
+    else:
+        items = [_row_to_item(resource_type, row) for row in rows]
     total_pages = (total + page_size - 1) // page_size if page_size else 0
 
     return PaginatedResponse(

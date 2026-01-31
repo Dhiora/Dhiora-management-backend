@@ -94,10 +94,8 @@ class StaffProfile(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id = Column(UUID(as_uuid=True), ForeignKey("auth.users.id", ondelete="CASCADE"), nullable=False)
-    employee_number = Column(String(50), nullable=True)  # Legacy; prefer employee_code for new records
     employee_code = Column(String(50), nullable=True)  # Auto-generated: <ORG_CODE>-EMP-<SEQ>; not editable after creation
     department_id = Column(UUID(as_uuid=True), ForeignKey("core.departments.id"), nullable=True)
-    department = Column(String(100), nullable=True)  # Legacy free-text; prefer department_id
     designation = Column(String(100), nullable=True)
     join_date = Column(Date, nullable=True)
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
@@ -107,18 +105,17 @@ class StaffProfile(Base):
 
 
 class StudentProfile(Base):
-    """Profile for student users. class_id/section_id reference tenant master data; no free text."""
+    """
+    Profile for student users. Does NOT store class/section.
+    Current class/section come from student_academic_records (current academic year).
+    """
 
     __tablename__ = "student_profiles"
     __table_args__ = ({"schema": "auth"},)
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id = Column(UUID(as_uuid=True), ForeignKey("auth.users.id", ondelete="CASCADE"), nullable=False)
-    roll_number = Column(String(50), nullable=True)
-    class_id = Column(UUID(as_uuid=True), ForeignKey("core.classes.id"), nullable=True)
-    section_id = Column(UUID(as_uuid=True), ForeignKey("core.sections.id"), nullable=True)
-    class_ = Column("class", String(50), nullable=True)  # Legacy free-text
-    section = Column(String(50), nullable=True)  # Legacy free-text
+    roll_number = Column(String(50), nullable=True)  # Legacy/display; per-year roll in student_academic_records
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
 
     user = relationship("User", back_populates="student_profile")
