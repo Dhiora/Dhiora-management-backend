@@ -4,6 +4,38 @@ Master configuration for academic data. One academic year per tenant can be "cur
 
 ---
 
+## 0. Login Default Academic Year
+
+On user login:
+
+- The system fetches the ACTIVE academic year for the tenant: `WHERE tenant_id = user.tenant_id AND is_current = true`.
+- If an academic year is found and `status = ACTIVE`, its `id` and `status` are embedded in the access token.
+- If **no** active academic year is found:
+  - **Non-admin** users: login is blocked with `"No active academic year found. Please contact administrator."`
+  - **Admin** (ADMIN, PLATFORM_ADMIN, SUPER_ADMIN): login is allowed; token has no `academic_year_id` (frontend can prompt to create/set one).
+
+**Token payload** includes:
+
+- `sub`, `user_id`, `tenant_id`, `role`, `modules`, `iat`, `exp`
+- `academic_year_id` (UUID string) – ACTIVE year at login
+- `academic_year_status` – `"ACTIVE"` or `"CLOSED"`
+
+**Request context** (from token):
+
+- `CurrentUser.academic_year_id`, `CurrentUser.academic_year_status` are available on every authenticated request.
+- APIs should apply `tenant_id` and `academic_year_id` filters from context; academic year must **not** be accepted from query/body/headers (except controlled admin override).
+
+**CLOSED academic year:**
+
+- When `academic_year_status = CLOSED`, all CREATE/UPDATE/DELETE operations are blocked with: `"This academic year is closed and cannot be modified."`
+- Use the `require_writable_academic_year` dependency on write endpoints (attendance mark, homework assignment/submit, etc.).
+
+**Academic year switch:**
+
+- Switching academic year must re-issue a **new** token (new `academic_year_id`/`academic_year_status`); the old token is not mutated in place.
+
+---
+
 ## 1. Database Schema
 
 ### Table: `core.academic_years`

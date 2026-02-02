@@ -4,10 +4,12 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi import status as http_status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth.dependencies import get_current_user
 from app.auth.rbac import require_platform_admin
 from app.core.enums import OrganizationType
 from app.core.schemas import (
     ModulesByOrganizationTypeResponse,
+    ModulesByTenantResponse,
     OrganizationTypeModuleCreate,
     OrganizationTypeModuleResponse,
     OrganizationTypeModuleUpdate,
@@ -17,11 +19,25 @@ from app.core.services import (
     create_organization_type_module,
     delete_organization_type_module,
     get_modules_by_organization_type,
+    get_modules_by_tenant_id,
     update_organization_type_module,
 )
+from app.auth.schemas import CurrentUser
 from app.db.session import get_db
 
 router = APIRouter(prefix="/api/v1/modules", tags=["modules"])
+
+
+@router.get("/by-tenant", response_model=ModulesByTenantResponse)
+async def get_modules_by_tenant(
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+) -> ModulesByTenantResponse:
+    """Get modules enabled for the current user's tenant. Uses tenant_id from auth token."""
+    try:
+        return await get_modules_by_tenant_id(db, current_user.tenant_id)
+    except ServiceError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
 
 
 @router.get("/by-organization-type", response_model=ModulesByOrganizationTypeResponse)

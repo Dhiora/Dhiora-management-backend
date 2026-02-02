@@ -34,6 +34,20 @@ class ModulesByOrganizationTypeResponse(BaseModel):
     modules: List[OrganizationTypeModuleInfo]
 
 
+class TenantModuleInfo(BaseModel):
+    """Module info for a tenant (from tenant_modules)."""
+
+    module: ModuleInfo
+    is_enabled: bool
+
+
+class ModulesByTenantResponse(BaseModel):
+    """Response containing modules enabled for a tenant."""
+
+    tenant_id: UUID
+    modules: List[TenantModuleInfo]
+
+
 class OrganizationTypeModuleCreate(BaseModel):
     """Payload to create an organization-type-to-module mapping."""
 

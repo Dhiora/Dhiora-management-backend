@@ -6,7 +6,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth.dependencies import get_current_user
+from app.auth.dependencies import get_current_user, require_writable_academic_year
 from app.auth.rbac import check_permission
 from app.auth.schemas import CurrentUser
 from app.core.exceptions import ServiceError
@@ -270,7 +270,7 @@ async def delete_question(
     "/assignments",
     response_model=HomeworkAssignmentResponse,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(check_permission("homework", "create"))],
+    dependencies=[Depends(check_permission("homework", "create")), Depends(require_writable_academic_year)],
 )
 async def create_assignment(
     payload: HomeworkAssignmentCreate,
@@ -340,7 +340,7 @@ async def list_my_assignments(
     "/assignments/{assignment_id}/start",
     response_model=HomeworkAttemptResponse,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(check_permission("homework", "create"))],
+    dependencies=[Depends(check_permission("homework", "create")), Depends(require_writable_academic_year)],
 )
 async def start_attempt(
     assignment_id: UUID,
@@ -360,7 +360,7 @@ async def start_attempt(
     "/attempts/{attempt_id}/submit",
     response_model=HomeworkSubmissionResponse,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(check_permission("homework", "create"))],
+    dependencies=[Depends(check_permission("homework", "create")), Depends(require_writable_academic_year)],
 )
 async def submit_homework(
     attempt_id: UUID,

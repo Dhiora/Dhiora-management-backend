@@ -6,7 +6,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth.dependencies import get_current_user
+from app.auth.dependencies import get_current_user, require_writable_academic_year
 from app.auth.rbac import check_permission
 from app.auth.schemas import CurrentUser
 from app.core.exceptions import ServiceError
@@ -32,7 +32,7 @@ router = APIRouter(prefix="/api/v1/attendance", tags=["attendance"])
 @router.post(
     "/students/mark",
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(check_permission("attendance", "create"))],
+    dependencies=[Depends(check_permission("attendance", "create")), Depends(require_writable_academic_year)],
 )
 async def mark_student_attendance(
     payload: StudentAttendanceBulkMark,
@@ -111,7 +111,7 @@ async def get_student_monthly_attendance(
 @router.post(
     "/employees/mark",
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(check_permission("attendance", "create"))],
+    dependencies=[Depends(check_permission("attendance", "create")), Depends(require_writable_academic_year)],
 )
 async def mark_employee_attendance(
     payload: EmployeeAttendanceBulkMark,
@@ -185,7 +185,7 @@ async def get_employee_monthly_attendance(
 @router.post(
     "/teacher-assignments",
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(check_permission("attendance", "create"))],
+    dependencies=[Depends(check_permission("attendance", "create")), Depends(require_writable_academic_year)],
 )
 async def create_teacher_assignment(
     payload: TeacherClassAssignmentCreate,

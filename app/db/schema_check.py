@@ -211,6 +211,15 @@ CREATE_TABLE_SQL: Dict[Tuple[str, str], str] = {
 }
 
 
+ALTER_TENANT_MODULES_ENABLED_AT: str = """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='core' AND table_name='tenant_modules' AND column_name='enabled_at') THEN
+            ALTER TABLE core.tenant_modules ADD COLUMN enabled_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+        END IF;
+    END $$;
+"""
+
 ALTER_USERS_USER_TYPE: str = """
     DO $$
     BEGIN
@@ -658,6 +667,7 @@ async def ensure_tables(db_engine: AsyncEngine) -> None:
                 await conn.execute(text(create_sql))
 
         # Add user_type and role_id to auth.users if columns are missing (existing DBs)
+        await conn.execute(text(ALTER_TENANT_MODULES_ENABLED_AT))
         await conn.execute(text(ALTER_USERS_USER_TYPE))
 
         # Add organization_code to core.tenants if column missing (existing DBs)

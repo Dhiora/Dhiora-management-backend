@@ -7,11 +7,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
 from app.core.exceptions import ServiceError
-from app.core.models import Module, OrganizationTypeModule, SubscriptionPlan
+from app.core.models import Module, OrganizationTypeModule, SubscriptionPlan, TenantModule
 from app.core.schemas import (
     ModuleInfo,
     ModulesByOrganizationTypeResponse,
+    ModulesByTenantResponse,
     OrganizationTypeModuleInfo,
+    TenantModuleInfo,
     OrganizationTypeModuleCreate,
     OrganizationTypeModuleResponse,
     OrganizationTypeModuleUpdate,
@@ -87,6 +89,27 @@ async def get_modules_by_organization_type(
         organization_type=organization_type,
         modules=sorted(modules_dict.values(), key=lambda x: x.module.module_key),
     )
+
+
+async def get_modules_by_tenant_id(
+    db: AsyncSession, tenant_id: UUID
+) -> ModulesByTenantResponse:
+    """Fetch all modules enabled for a tenant (from tenant_modules)."""
+    result = await db.execute(
+        select(TenantModule, Module)
+        .join(Module, TenantModule.module_key == Module.module_key)
+        .where(TenantModule.tenant_id == tenant_id, TenantModule.is_enabled == True)  # noqa: E712
+        .order_by(Module.module_key)
+    )
+    rows = result.all()
+    modules_list = [
+        TenantModuleInfo(
+            module=_build_module_info(module),
+            is_enabled=tm.is_enabled,
+        )
+        for tm, module in rows
+    ]
+    return ModulesByTenantResponse(tenant_id=tenant_id, modules=modules_list)
 
 
 async def create_organization_type_module(

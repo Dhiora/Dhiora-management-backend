@@ -61,6 +61,13 @@ class TenantInfo(BaseModel):
     organization_type: str
 
 
+class AcademicYearContext(BaseModel):
+    """Active academic year embedded in the session/token."""
+
+    id: Optional[UUID] = None
+    status: Optional[str] = None  # ACTIVE | CLOSED
+
+
 class LoginResponse(BaseModel):
     access_token: str
     refresh_token: str
@@ -68,6 +75,7 @@ class LoginResponse(BaseModel):
     user: UserInfo
     tenant: TenantInfo
     modules: List[str]
+    academic_year: Optional[AcademicYearContext] = None  # ACTIVE year at login; None if admin and none set
     issued_at: datetime
 
 
@@ -81,7 +89,18 @@ class RoleUpdate(BaseModel):
     permissions: Optional[Dict[str, Dict[str, bool]]] = None
 
 
+class RoleListResponse(BaseModel):
+    """Role summary for list: permissions as list of module names (e.g. Admissions, student, homework)."""
+
+    id: UUID
+    name: str
+    permissions: List[str] = Field(default_factory=list, description="List of module/permission names the role has access to")
+    is_default: bool = False
+
+
 class RoleResponse(BaseModel):
+    """Full role with granular permissions (create/read/update/delete per module). Used for get-by-id and create/update."""
+
     id: UUID
     name: str
     permissions: Dict[str, Dict[str, bool]]
@@ -89,10 +108,14 @@ class RoleResponse(BaseModel):
 
 
 class CurrentUser(BaseModel):
-    """Lightweight representation of the authenticated user for RBAC checks."""
+    """Lightweight representation of the authenticated user for RBAC checks.
+    academic_year_id and academic_year_status come from the ACTIVE academic year at login.
+    """
 
     id: UUID
     tenant_id: UUID
     role: str
     permissions: Dict[str, Dict[str, bool]]
+    academic_year_id: Optional[UUID] = None  # ACTIVE academic year (is_current=true) at login
+    academic_year_status: Optional[str] = None  # ACTIVE | CLOSED; CLOSED => read-only
 

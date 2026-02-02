@@ -1,16 +1,20 @@
+from datetime import datetime, timezone
 from typing import List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import get_current_user
 from app.auth.rbac import check_permission
 from app.auth.schemas import CurrentUser
+from app.auth.security import create_access_token
 from app.core.exceptions import ServiceError
+from app.core.models import Tenant, TenantModule
 from app.db.session import get_db
 
-from .schemas import AcademicYearCreate, AcademicYearResponse, AcademicYearUpdate
+from .schemas import AcademicYearCreate, AcademicYearResponse, AcademicYearUpdate, CreateAcademicYearResponse
 from . import service
 
 router = APIRouter(prefix="/api/v1/academic-years", tags=["academic-years"])
@@ -18,7 +22,7 @@ router = APIRouter(prefix="/api/v1/academic-years", tags=["academic-years"])
 
 @router.post(
     "",
-    response_model=AcademicYearResponse,
+    response_model=CreateAcademicYearResponse,
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(check_permission("academic_years", "create"))],
 )
@@ -26,12 +30,39 @@ async def create_academic_year(
     payload: AcademicYearCreate,
     db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
-) -> AcademicYearResponse:
-    """Create academic year. Admin only. If is_current=true, others for tenant become non-current."""
+) -> CreateAcademicYearResponse:
+    """Create academic year. Use set_as_current=true to set as current and receive a new access_token in the response."""
     try:
-        return await service.create_academic_year(db, current_user.tenant_id, payload)
+        created = await service.create_academic_year(db, current_user.tenant_id, payload)
     except ServiceError as e:
         raise HTTPException(status_code=e.status_code, detail=e.message)
+
+    access_token: Optional[str] = None
+    if payload.set_as_current and created.is_current:
+        tenant_result = await db.execute(select(Tenant).where(Tenant.id == current_user.tenant_id))
+        tenant = tenant_result.scalar_one_or_none()
+        modules_result = await db.execute(
+            select(TenantModule.module_key).where(
+                TenantModule.tenant_id == current_user.tenant_id,
+                TenantModule.is_enabled.is_(True),
+            )
+        )
+        modules: List[str] = [r[0] for r in modules_result.all()]
+        issued_at = datetime.now(timezone.utc)
+        token_payload = {
+            "sub": str(current_user.id),
+            "user_id": str(current_user.id),
+            "tenant_id": str(current_user.tenant_id),
+            "organization_code": tenant.organization_code if tenant else "",
+            "role": current_user.role,
+            "modules": modules,
+            "academic_year_id": str(created.id),
+            "academic_year_status": created.status,
+            "iat": int(issued_at.timestamp()),
+        }
+        access_token = create_access_token(subject=token_payload)
+
+    return CreateAcademicYearResponse(academic_year=created, access_token=access_token)
 
 
 @router.get(

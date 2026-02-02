@@ -53,7 +53,8 @@ async def create_academic_year(
             f"Academic year with name '{payload.name}' already exists for this tenant",
             status.HTTP_409_CONFLICT,
         )
-    if payload.is_current:
+    is_current = getattr(payload, "is_current", getattr(payload, "set_as_current", False))
+    if is_current:
         await db.execute(
             update(AcademicYear).where(AcademicYear.tenant_id == tenant_id).values(is_current=False)
         )
@@ -62,7 +63,7 @@ async def create_academic_year(
         name=payload.name.strip(),
         start_date=payload.start_date,
         end_date=payload.end_date,
-        is_current=payload.is_current,
+        is_current=is_current,
         status="ACTIVE",
         admissions_allowed=payload.admissions_allowed,
     )

@@ -11,8 +11,13 @@ class AcademicYearCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=50, description="e.g. 2025-2026")
     start_date: date = Field(..., description="Academic year start date")
     end_date: date = Field(..., description="Academic year end date (must be after start_date)")
-    is_current: bool = Field(False, description="If true, all other years for tenant become is_current=false")
+    set_as_current: bool = Field(
+        False,
+        description="Set this year as current? If true, all other years for tenant become non-current and a new access_token is returned.",
+    )
     admissions_allowed: bool = Field(True, description="Whether student admissions are allowed for this year")
+
+
 
 
 class AcademicYearUpdate(BaseModel):
@@ -40,3 +45,13 @@ class AcademicYearResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class CreateAcademicYearResponse(BaseModel):
+    """Response when creating an academic year. Returns new access_token when set_as_current=true."""
+
+    academic_year: AcademicYearResponse
+    access_token: Optional[str] = Field(
+        None,
+        description="New JWT with academic_year_id and academic_year_status. Present only when set_as_current=true.",
+    )

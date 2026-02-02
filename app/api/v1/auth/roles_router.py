@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth.dependencies import get_current_user
 from app.auth.models import Role
 from app.auth.rbac import check_permission
-from app.auth.schemas import CurrentUser, RoleCreate, RoleResponse, RoleUpdate
+from app.auth.schemas import CurrentUser, RoleCreate, RoleListResponse, RoleResponse, RoleUpdate
 from app.core.models import Tenant
 from app.db.session import get_db
 
@@ -67,15 +67,22 @@ async def create_role(
     return RoleResponse(id=_to_uuid(role.id), name=role.name, permissions=role.permissions, is_default=is_default)
 
 
+def _permission_keys(permissions: Optional[dict]) -> List[str]:
+    """Return list of module names the role has any permission for (e.g. roles, academic_years, students)."""
+    if not permissions:
+        return []
+    return sorted(permissions.keys())
+
+
 @router.get(
     "",
-    response_model=List[RoleResponse],
+    response_model=List[RoleListResponse],
     dependencies=[Depends(check_permission("roles", "read"))],
 )
 async def list_roles(
     db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
-) -> List[RoleResponse]:
+) -> List[RoleListResponse]:
     platform_tenant_id = await _get_platform_tenant_id(db)
     # Tenant's own roles
     stmt = (
@@ -85,7 +92,10 @@ async def list_roles(
     )
     result = await db.execute(stmt)
     tenant_roles = result.scalars().all()
-    out = [RoleResponse(id=_to_uuid(r.id), name=r.name, permissions=r.permissions, is_default=False) for r in tenant_roles]
+    out = [
+        RoleListResponse(id=_to_uuid(r.id), name=r.name, permissions=_permission_keys(r.permissions), is_default=False)
+        for r in tenant_roles
+    ]
     # Append default roles (platform tenant) for all tenants so they can see and use them
     if platform_tenant_id and current_user.tenant_id != platform_tenant_id:
         default_stmt = (
@@ -96,9 +106,38 @@ async def list_roles(
         default_result = await db.execute(default_stmt)
         default_roles = default_result.scalars().all()
         out.extend(
-            RoleResponse(id=_to_uuid(r.id), name=r.name, permissions=r.permissions, is_default=True) for r in default_roles
+            RoleListResponse(id=_to_uuid(r.id), name=r.name, permissions=_permission_keys(r.permissions), is_default=True)
+            for r in default_roles
         )
     return out
+
+
+@router.get(
+    "/{role_id}",
+    response_model=RoleResponse,
+    dependencies=[Depends(check_permission("roles", "read"))],
+)
+async def get_role_by_id(
+    role_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+) -> RoleResponse:
+    """Get a single role by id with all permissions. Tenant-scoped (or platform default)."""
+    stmt = select(Role).where(Role.id == role_id)
+    result = await db.execute(stmt)
+    role = result.scalar_one_or_none()
+    if not role:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Role not found")
+    platform_tenant_id = await _get_platform_tenant_id(db)
+    is_default = platform_tenant_id is not None and _to_uuid(role.tenant_id) == platform_tenant_id
+    if not is_default and _to_uuid(role.tenant_id) != current_user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Role not found")
+    return RoleResponse(
+        id=_to_uuid(role.id),
+        name=role.name,
+        permissions=role.permissions or {},
+        is_default=is_default,
+    )
 
 
 @router.put(

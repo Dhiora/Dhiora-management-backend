@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from typing import List, Optional
+from uuid import UUID
 
 from fastapi import status
 from sqlalchemy import select, func
@@ -7,6 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.schemas import (
+    AcademicYearContext,
     LoginRequest,
     LoginResponse,
     RegisterRequest,
@@ -22,7 +24,7 @@ from app.auth.security import (
 )
 from app.auth.models import RefreshToken, User
 from app.core.exceptions import ServiceError
-from app.core.models import Module, Tenant, TenantModule
+from app.core.models import AcademicYear, Module, Tenant, TenantModule
 from app.core.tenant_service import generate_organization_code
 
 
@@ -167,23 +169,50 @@ async def login_user(db: AsyncSession, payload: LoginRequest) -> LoginResponse:
     modules_result = await db.execute(modules_stmt)
     modules: List[str] = [row[0] for row in modules_result.all()]
 
+    # 6. Fetch ACTIVE academic year (is_current = true) for tenant
+    ay_stmt = (
+        select(AcademicYear)
+        .where(AcademicYear.tenant_id == user.tenant_id)
+        .where(AcademicYear.is_current.is_(True))
+    )
+    ay_result = await db.execute(ay_stmt)
+    active_ay: Optional[AcademicYear] = ay_result.scalar_one_or_none()
+
+    academic_year_id: Optional[str] = None
+    academic_year_status: Optional[str] = None
+    if active_ay and active_ay.status == "ACTIVE":
+        academic_year_id = str(active_ay.id)
+        academic_year_status = active_ay.status
+    else:
+        # No active academic year or it is CLOSED
+        admin_roles = ("SUPER_ADMIN", "PLATFORM_ADMIN", "ADMIN")
+        if user.role not in admin_roles:
+            raise ServiceError(
+                "No active academic year found. Please contact administrator.",
+                status.HTTP_403_FORBIDDEN,
+            )
+        # Admin can log in; token will have no academic_year_id (frontend can prompt to create/set one)
+
     issued_at = datetime.now(timezone.utc)
 
-    # 6. Generate access token (JWT); include organization_code for convenience, tenant_id remains primary
+    # 7. Generate access token (JWT); include academic year context
     access_payload = {
+        "sub": str(user.id),
         "user_id": str(user.id),
         "tenant_id": str(user.tenant_id),
         "organization_code": tenant.organization_code,
         "role": user.role,
         "modules": modules,
+        "academic_year_id": academic_year_id,
+        "academic_year_status": academic_year_status,
         "iat": int(issued_at.timestamp()),
     }
     access_token = create_access_token(subject=access_payload)
 
-    # 7. Generate refresh token
+    # 8. Generate refresh token
     refresh_token_str, refresh_expires_at = create_refresh_token()
 
-    # 8. Store refresh token
+    # 9. Store refresh token
     refresh_token = RefreshToken(
         user_id=user.id,
         token=refresh_token_str,
@@ -199,7 +228,7 @@ async def login_user(db: AsyncSession, payload: LoginRequest) -> LoginResponse:
             status.HTTP_500_INTERNAL_SERVER_ERROR,
         ) from e
 
-    # 9. Return auth payload
+    # 10. Return auth payload
     user_info = UserInfo(
         id=user.id,
         name=user.full_name,
@@ -213,12 +242,17 @@ async def login_user(db: AsyncSession, payload: LoginRequest) -> LoginResponse:
         organization_type=tenant.organization_type,
     )
 
+    academic_year_ctx: Optional[AcademicYearContext] = None
+    if academic_year_id and academic_year_status:
+        academic_year_ctx = AcademicYearContext(id=UUID(academic_year_id), status=academic_year_status)
+
     return LoginResponse(
         access_token=access_token,
         refresh_token=refresh_token_str,
         user=user_info,
         tenant=tenant_info,
         modules=modules,
+        academic_year=academic_year_ctx,
         issued_at=issued_at,
     )
 
