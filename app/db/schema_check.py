@@ -208,6 +208,16 @@ CREATE_TABLE_SQL: Dict[Tuple[str, str], str] = {
             CONSTRAINT uq_student_profile_user UNIQUE (user_id)
         );
     """,
+    ("auth", "teacher_referrals"): """
+        CREATE TABLE IF NOT EXISTS auth.teacher_referrals (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            teacher_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+            tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+            referral_code VARCHAR(20) NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT uq_teacher_referral_tenant_code UNIQUE (tenant_id, referral_code)
+        );
+    """,
 }
 
 
@@ -477,6 +487,22 @@ STUDENT_ACADEMIC_RECORDS_TABLE: str = """
     );
 """
 
+# school.referral_usage - teacher-referred students (immutable after admission)
+REFERRAL_USAGE_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.referral_usage (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        referral_code VARCHAR(20) NOT NULL,
+        teacher_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE RESTRICT,
+        student_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+        admission_id UUID NOT NULL REFERENCES school.student_academic_records(id) ON DELETE CASCADE,
+        academic_year_id UUID NOT NULL REFERENCES core.academic_years(id) ON DELETE RESTRICT,
+        used_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_referral_usage_student UNIQUE (student_id),
+        CONSTRAINT uq_referral_usage_admission UNIQUE (admission_id)
+    );
+"""
+
 # school.teacher_class_assignments - which teacher teaches which class-section (for attendance scope)
 TEACHER_CLASS_ASSIGNMENTS_TABLE: str = """
     CREATE TABLE IF NOT EXISTS school.teacher_class_assignments (
@@ -654,6 +680,7 @@ async def ensure_tables(db_engine: AsyncEngine) -> None:
             ("auth", "refresh_tokens"),
             ("auth", "staff_profiles"),
             ("auth", "student_profiles"),
+            ("auth", "teacher_referrals"),
         ]
         for schema, table in order_tables:
             full_name = f"{schema}.{table}"
@@ -667,6 +694,7 @@ async def ensure_tables(db_engine: AsyncEngine) -> None:
                 await conn.execute(text(create_sql))
 
         # Add user_type and role_id to auth.users if columns are missing (existing DBs)
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_teacher_referrals_referral_code ON auth.teacher_referrals(referral_code)"))
         await conn.execute(text(ALTER_TENANT_MODULES_ENABLED_AT))
         await conn.execute(text(ALTER_USERS_USER_TYPE))
 
@@ -687,6 +715,11 @@ async def ensure_tables(db_engine: AsyncEngine) -> None:
         await conn.execute(text(ALTER_ACADEMIC_YEARS_EXTRA))
         await conn.execute(text(ALTER_ACADEMIC_YEARS_CLOSED_BY_FK))
         await conn.execute(text(STUDENT_ACADEMIC_RECORDS_TABLE))
+        await conn.execute(text(REFERRAL_USAGE_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_referral_usage_tenant_id ON school.referral_usage(tenant_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_referral_usage_referral_code ON school.referral_usage(referral_code)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_referral_usage_teacher_id ON school.referral_usage(teacher_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_referral_usage_academic_year_id ON school.referral_usage(academic_year_id)"))
         await conn.execute(text(TEACHER_CLASS_ASSIGNMENTS_TABLE))
         await conn.execute(text(STUDENT_ATTENDANCE_TABLE))
         await conn.execute(text(EMPLOYEE_ATTENDANCE_TABLE))

@@ -13,8 +13,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.auth.models import Role, StaffProfile, StudentProfile, User
-from app.core.models import AcademicYear, Section, StudentAcademicRecord
+from app.auth.models import Role, StaffProfile, StudentProfile, User, TeacherReferral
+from app.auth.referral_code import generate_teacher_referral_code
+from app.core.models import AcademicYear, ReferralUsage, Section, StudentAcademicRecord
 from app.auth.security import hash_password
 from app.core.exceptions import ServiceError
 from app.core.models import Tenant
@@ -43,6 +44,63 @@ from .schemas import (
 
 
 DEFAULT_STUDENT_ROLE_NAME = "STUDENT"
+
+
+async def store_teacher_referral_usage(
+    db: AsyncSession,
+    tenant_id: UUID,
+    referral_code: str,
+    student_id: UUID,
+    admission_id: UUID,
+    academic_year_id: UUID,
+) -> None:
+    """
+    Store that a student was admitted using a teacher's referral code.
+    Call only after student and student_academic_record are created, in the same transaction.
+    Validates: referral code exists for tenant, teacher is active, no duplicate student/admission.
+    Raises ServiceError on validation failure. Does not commit; caller must commit.
+    """
+    code = (referral_code or "").strip().upper()
+    if not code:
+        raise ServiceError("Referral code is required when storing referral usage", status.HTTP_400_BAD_REQUEST)
+
+    ref_row = await db.execute(
+        select(TeacherReferral).where(
+            TeacherReferral.tenant_id == tenant_id,
+            TeacherReferral.referral_code == code,
+        )
+    )
+    tr = ref_row.scalar_one_or_none()
+    if not tr:
+        raise ServiceError(
+            "Invalid referral code or code does not belong to this tenant.",
+            status.HTTP_400_BAD_REQUEST,
+        )
+
+    teacher = await db.get(User, tr.teacher_id)
+    if not teacher or teacher.tenant_id != tenant_id:
+        raise ServiceError("Referral code references an invalid teacher.", status.HTTP_400_BAD_REQUEST)
+    if teacher.status != "ACTIVE":
+        raise ServiceError("Referral code belongs to an inactive teacher.", status.HTTP_400_BAD_REQUEST)
+    if teacher.role != "Teacher":
+        raise ServiceError("Referral code must belong to a teacher.", status.HTTP_400_BAD_REQUEST)
+
+    existing_student = await db.execute(select(ReferralUsage).where(ReferralUsage.student_id == student_id))
+    if existing_student.scalar_one_or_none():
+        raise ServiceError("This student has already been linked to a referral.", status.HTTP_409_CONFLICT)
+    existing_admission = await db.execute(select(ReferralUsage).where(ReferralUsage.admission_id == admission_id))
+    if existing_admission.scalar_one_or_none():
+        raise ServiceError("This admission is already linked to a referral.", status.HTTP_409_CONFLICT)
+
+    usage = ReferralUsage(
+        tenant_id=tenant_id,
+        referral_code=code,
+        teacher_id=tr.teacher_id,
+        student_id=student_id,
+        admission_id=admission_id,
+        academic_year_id=academic_year_id,
+    )
+    db.add(usage)
 
 
 def _to_uuid(value) -> Optional[UUID]:
@@ -247,6 +305,28 @@ async def create_employee(
         await db.commit()
         await db.refresh(user)
         await db.refresh(staff_profile)
+
+        if role.name == "Teacher":
+            max_attempts = 5
+            for attempt in range(max_attempts):
+                referral_code = generate_teacher_referral_code(payload.full_name)
+                ref = TeacherReferral(
+                    teacher_id=user.id,
+                    tenant_id=tenant_id,
+                    referral_code=referral_code,
+                )
+                db.add(ref)
+                try:
+                    await db.commit()
+                    break
+                except IntegrityError:
+                    await db.rollback()
+                    if attempt == max_attempts - 1:
+                        raise ServiceError(
+                            "Could not generate unique referral code for teacher after retries",
+                            status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        )
+
         user.staff_profile = staff_profile
         return _user_to_employee_response(user)
     except IntegrityError:
@@ -420,6 +500,18 @@ async def create_student(
             status="ACTIVE",
         )
         db.add(record)
+        await db.flush()
+
+        if getattr(payload, "referral_code", None) and str(payload.referral_code).strip():
+            await store_teacher_referral_usage(
+                db,
+                tenant_id,
+                payload.referral_code,
+                user.id,
+                record.id,
+                ay.id,
+            )
+
         await db.commit()
         await db.refresh(user)
         await db.refresh(student_profile)

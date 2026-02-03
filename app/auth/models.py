@@ -121,3 +121,20 @@ class StudentProfile(Base):
     user = relationship("User", back_populates="student_profile")
 
 
+class TeacherReferral(Base):
+    """Unique referral code per teacher, scoped by tenant. Only teachers get a row."""
+
+    __tablename__ = "teacher_referrals"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "referral_code", name="uq_teacher_referral_tenant_code"),
+        {"schema": "auth"},
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    teacher_id = Column(UUID(as_uuid=True), ForeignKey("auth.users.id", ondelete="CASCADE"), nullable=False)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("core.tenants.id", ondelete="CASCADE"), nullable=False)
+    referral_code = Column(String(20), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+
+    user = relationship("User", foreign_keys=[teacher_id])
+

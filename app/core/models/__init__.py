@@ -16,6 +16,7 @@ from app.core.models.department import Department
 from app.core.models.module import Module, OrganizationTypeModule
 from app.core.models.section_model import Section
 from app.core.models.subscription_plan import SubscriptionPlan
+from app.core.models.referral_usage import ReferralUsage
 from app.core.models.tenant import Tenant, TenantModule
 
 __all__ = [
@@ -34,6 +35,7 @@ __all__ = [
     "SchoolClass",
     "Section",
     "StudentAttendance",
+    "ReferralUsage",
     "SubscriptionPlan",
     "TeacherClassAssignment",
     "Tenant",

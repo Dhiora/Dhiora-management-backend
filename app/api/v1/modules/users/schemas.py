@@ -102,7 +102,7 @@ class EmployeeResponse(BaseModel):
 
 # ----- Student -----
 class StudentCreate(BaseModel):
-    """Optional role_id: assign a tenant role (e.g. STUDENT1, STUDENT2). If omitted, role named 'STUDENT' is used."""
+    """Optional role_id: assign a tenant role. Optional referral_code: teacher referral for this admission."""
 
     full_name: str = Field(..., min_length=1)
     email: EmailStr
@@ -111,7 +111,8 @@ class StudentCreate(BaseModel):
     roll_number: Optional[str] = None
     class_id: UUID  # Required; must be active class for tenant
     section_id: UUID  # Required; must be active section for tenant
-    role_id: Optional[UUID] = Field(None, description="Tenant role to assign (e.g. STUDENT1, STUDENT2). If omitted, default 'STUDENT' role is used.")
+    role_id: Optional[UUID] = Field(None, description="Tenant role to assign. If omitted, default 'STUDENT' role is used.")
+    referral_code: Optional[str] = Field(None, max_length=20, description="Teacher referral code; optional at admission. Stored immutably in referral_usage.")
 
 
 class StudentPromote(BaseModel):
