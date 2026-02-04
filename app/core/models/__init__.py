@@ -18,6 +18,9 @@ from app.core.models.section_model import Section
 from app.core.models.subscription_plan import SubscriptionPlan
 from app.core.models.referral_usage import ReferralUsage
 from app.core.models.tenant import Tenant, TenantModule
+from app.core.models.admission_request import AdmissionRequest
+from app.core.models.admission_student import AdmissionStudent
+from app.core.models.audit_log import AuditLog
 
 __all__ = [
     "AcademicYear",
@@ -40,5 +43,8 @@ __all__ = [
     "TeacherClassAssignment",
     "Tenant",
     "TenantModule",
+    "AdmissionRequest",
+    "AdmissionStudent",
+    "AuditLog",
 ]
 

@@ -1,14 +1,13 @@
-from typing import List, Optional
+from typing import Dict, List, Optional
 from uuid import UUID
 
 from fastapi import status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth.models import StudentProfile
 from app.core.exceptions import ServiceError
-from app.core.models import Section
+from app.core.models import AcademicYear, Section, StudentAcademicRecord
 
 from app.api.v1.classes import service as class_service
 
@@ -21,13 +20,16 @@ def _to_uuid(val):
     return val if isinstance(val, UUID) else UUID(str(val))
 
 
-def _section_to_response(s: Section) -> SectionResponse:
+def _section_to_response(s: Section, occupied: int = 0) -> SectionResponse:
+    capacity = getattr(s, "capacity", 50)
     return SectionResponse(
         id=_to_uuid(s.id),
         tenant_id=_to_uuid(s.tenant_id),
         class_id=_to_uuid(s.class_id),
         name=s.name,
         display_order=s.display_order,
+        capacity=capacity,
+        occupied=occupied,
         is_active=s.is_active,
         created_at=s.created_at,
         updated_at=s.updated_at,
@@ -43,18 +45,20 @@ async def create_section(
     if not school_class:
         raise ServiceError("Invalid or inactive class for this tenant", status.HTTP_400_BAD_REQUEST)
     name = payload.name.strip()
+    capacity = getattr(payload, "capacity", 50) or 50
     try:
         obj = Section(
             tenant_id=tenant_id,
             class_id=payload.class_id,
             name=name,
             display_order=payload.display_order,
+            capacity=capacity,
             is_active=True,
         )
         db.add(obj)
         await db.commit()
         await db.refresh(obj)
-        return _section_to_response(obj)
+        return _section_to_response(obj, occupied=0)
     except IntegrityError:
         await db.rollback()
         raise ServiceError("Section name already exists for this class", status.HTTP_409_CONFLICT)
@@ -72,11 +76,13 @@ async def create_sections_bulk(
     try:
         created = []
         for item in payload.sections:
+            capacity = getattr(item, "capacity", 50) or 50
             obj = Section(
                 tenant_id=tenant_id,
                 class_id=payload.class_id,
                 name=item.name.strip(),
                 display_order=item.order,
+                capacity=capacity,
                 is_active=True,
             )
             db.add(obj)
@@ -85,10 +91,42 @@ async def create_sections_bulk(
         await db.commit()
         for obj in created:
             await db.refresh(obj)
-        return [_section_to_response(s) for s in created]
+        return [_section_to_response(s, occupied=0) for s in created]
     except IntegrityError:
         await db.rollback()
         raise ServiceError("Section name already exists for this class (duplicate in bulk or existing)", status.HTTP_409_CONFLICT)
+
+
+async def _get_current_academic_year_id(db: AsyncSession, tenant_id: UUID) -> Optional[UUID]:
+    """Current academic year (is_current=true) for tenant, or None."""
+    r = await db.execute(
+        select(AcademicYear.id).where(
+            AcademicYear.tenant_id == tenant_id,
+            AcademicYear.is_current.is_(True),
+        )
+    )
+    row = r.scalar_one_or_none()
+    return row if row is not None else None
+
+
+async def _get_occupied_by_section(
+    db: AsyncSession,
+    academic_year_id: UUID,
+    section_ids: List[UUID],
+) -> Dict[UUID, int]:
+    """Return map section_id -> count of students (ACTIVE records) in that section for the academic year."""
+    if not section_ids:
+        return {}
+    r = await db.execute(
+        select(StudentAcademicRecord.section_id, func.count(StudentAcademicRecord.id).label("cnt"))
+        .where(
+            StudentAcademicRecord.academic_year_id == academic_year_id,
+            StudentAcademicRecord.section_id.in_(section_ids),
+            StudentAcademicRecord.status == "ACTIVE",
+        )
+        .group_by(StudentAcademicRecord.section_id)
+    )
+    return {row.section_id: row.cnt for row in r.all()}
 
 
 async def list_sections(
@@ -105,7 +143,12 @@ async def list_sections(
     stmt = stmt.order_by(Section.display_order.nullslast(), Section.name)
     result = await db.execute(stmt)
     rows = result.scalars().all()
-    return [_section_to_response(s) for s in rows]
+    section_ids = [s.id for s in rows]
+    ay_id = await _get_current_academic_year_id(db, tenant_id)
+    occupied_map: Dict[UUID, int] = {}
+    if ay_id and section_ids:
+        occupied_map = await _get_occupied_by_section(db, ay_id, section_ids)
+    return [_section_to_response(s, occupied=occupied_map.get(s.id, 0)) for s in rows]
 
 
 async def get_section(
@@ -120,7 +163,14 @@ async def get_section(
         )
     )
     obj = result.scalar_one_or_none()
-    return _section_to_response(obj) if obj else None
+    if not obj:
+        return None
+    ay_id = await _get_current_academic_year_id(db, tenant_id)
+    occupied = 0
+    if ay_id:
+        occupied_map = await _get_occupied_by_section(db, ay_id, [obj.id])
+        occupied = occupied_map.get(obj.id, 0)
+    return _section_to_response(obj, occupied=occupied)
 
 
 async def update_section(
@@ -142,12 +192,19 @@ async def update_section(
         obj.name = payload.name.strip()
     if payload.display_order is not None:
         obj.display_order = payload.display_order
+    if getattr(payload, "capacity", None) is not None:
+        obj.capacity = payload.capacity
     if payload.is_active is not None:
         obj.is_active = payload.is_active
     try:
         await db.commit()
         await db.refresh(obj)
-        return _section_to_response(obj)
+        ay_id = await _get_current_academic_year_id(db, tenant_id)
+        occupied = 0
+        if ay_id:
+            occupied_map = await _get_occupied_by_section(db, ay_id, [obj.id])
+            occupied = occupied_map.get(obj.id, 0)
+        return _section_to_response(obj, occupied=occupied)
     except IntegrityError:
         await db.rollback()
         raise ServiceError("Section name already exists for this class", status.HTTP_409_CONFLICT)
@@ -170,7 +227,7 @@ async def delete_section(
         return False
     if block_if_used:
         used = await db.execute(
-            select(StudentProfile.id).where(StudentProfile.section_id == section_id).limit(1)
+            select(StudentAcademicRecord.id).where(StudentAcademicRecord.section_id == section_id).limit(1)
         )
         if used.scalar_one_or_none() is not None:
             raise ServiceError("Cannot delete section: it is used by students", status.HTTP_400_BAD_REQUEST)

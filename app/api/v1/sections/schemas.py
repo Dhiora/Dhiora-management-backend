@@ -9,12 +9,14 @@ class SectionCreate(BaseModel):
     class_id: UUID = Field(..., description="Class this section belongs to (e.g. 1st, 2nd)")
     name: str = Field(..., max_length=50)
     display_order: Optional[int] = None
+    capacity: int = Field(50, ge=1, description="Max students per section (default 50)")
 
 
 class SectionBulkItem(BaseModel):
-    """Single item for bulk create: name and display order."""
+    """Single item for bulk create: name, display order, and optional capacity."""
     name: str = Field(..., max_length=50)
     order: int = Field(..., description="Display order (e.g. 1, 2, 3)")
+    capacity: int = Field(50, ge=1, description="Max students per section (default 50)")
 
 
 class SectionBulkCreate(BaseModel):
@@ -25,6 +27,7 @@ class SectionBulkCreate(BaseModel):
 class SectionUpdate(BaseModel):
     name: Optional[str] = Field(None, max_length=50)
     display_order: Optional[int] = None
+    capacity: Optional[int] = Field(None, ge=1)
     is_active: Optional[bool] = None
 
 
@@ -34,6 +37,8 @@ class SectionResponse(BaseModel):
     class_id: UUID
     name: str
     display_order: Optional[int] = None
+    capacity: int = Field(..., description="Max students per section")
+    occupied: int = Field(0, description="Current enrollment in this section (current academic year)")
     is_active: bool
     created_at: datetime
     updated_at: datetime

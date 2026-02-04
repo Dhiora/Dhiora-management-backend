@@ -22,7 +22,7 @@ from app.auth.security import (
     hash_password,
     verify_password,
 )
-from app.auth.models import RefreshToken, User
+from app.auth.models import RefreshToken, Role, User
 from app.core.exceptions import ServiceError
 from app.core.models import AcademicYear, Module, Tenant, TenantModule
 from app.core.tenant_service import generate_organization_code
@@ -195,7 +195,16 @@ async def login_user(db: AsyncSession, payload: LoginRequest) -> LoginResponse:
 
     issued_at = datetime.now(timezone.utc)
 
-    # 7. Generate access token (JWT); include academic year context
+    # 6b. Fetch role permissions for RBAC (admissions.create/update, students.update, etc.)
+    permissions: dict = {}
+    if user.role_id:
+        role_stmt = select(Role).where(Role.id == user.role_id, Role.tenant_id == user.tenant_id)
+        role_result = await db.execute(role_stmt)
+        role = role_result.scalar_one_or_none()
+        if role and role.permissions:
+            permissions = role.permissions
+
+    # 7. Generate access token (JWT); include academic year context and permissions
     access_payload = {
         "sub": str(user.id),
         "user_id": str(user.id),
@@ -203,6 +212,7 @@ async def login_user(db: AsyncSession, payload: LoginRequest) -> LoginResponse:
         "organization_code": tenant.organization_code,
         "role": user.role,
         "modules": modules,
+        "permissions": permissions,
         "academic_year_id": academic_year_id,
         "academic_year_status": academic_year_status,
         "iat": int(issued_at.timestamp()),

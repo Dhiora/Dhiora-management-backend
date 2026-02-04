@@ -23,6 +23,7 @@ class Section(Base):
     class_id = Column(UUID(as_uuid=True), ForeignKey("core.classes.id"), nullable=False)
     name = Column(String(50), nullable=False)
     display_order = Column(Integer, nullable=True)
+    capacity = Column(Integer, nullable=False, default=50)
     is_active = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)

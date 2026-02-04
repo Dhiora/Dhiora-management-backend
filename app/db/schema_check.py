@@ -13,6 +13,9 @@ REQUIRED_TABLES: List[Tuple[str, str]] = [
     ("core", "academic_years"),
     ("core", "departments"),
     ("school", "student_academic_records"),
+    ("school", "admission_requests"),
+    ("school", "admission_students"),
+    ("school", "audit_logs"),
     ("core", "classes"),
     ("core", "sections"),
     ("core", "tenant_modules"),
@@ -112,6 +115,7 @@ CREATE_TABLE_SQL: Dict[Tuple[str, str], str] = {
             class_id UUID NOT NULL REFERENCES core.classes(id),
             name VARCHAR(50) NOT NULL,
             display_order INTEGER,
+            capacity INTEGER NOT NULL DEFAULT 50,
             is_active BOOLEAN NOT NULL DEFAULT TRUE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -374,6 +378,19 @@ ALTER_SECTIONS_ADD_CLASS_NAME_UNIQUE: str = """
     END $$;
 """
 
+# Add capacity to core.sections (default 50 per section; backfill existing rows to 50)
+ALTER_SECTIONS_CAPACITY: str = """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'core' AND table_name = 'sections' AND column_name = 'capacity'
+        ) THEN
+            ALTER TABLE core.sections ADD COLUMN capacity INTEGER NOT NULL DEFAULT 50;
+        END IF;
+    END $$;
+"""
+
 # Add price column to core.modules (for existing DBs)
 ALTER_MODULES_PRICE: str = """
     DO $$
@@ -625,6 +642,71 @@ HOMEWORK_HINT_USAGE_TABLE: str = """
     );
 """
 
+# ----- Admission Management -----
+# school.admission_requests - TRACK immutable, STATUS mutable; approval creates admission_student
+ADMISSION_REQUESTS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.admission_requests (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        student_name VARCHAR(255) NOT NULL,
+        parent_name VARCHAR(255),
+        mobile VARCHAR(50),
+        email VARCHAR(255),
+        class_applied_for UUID NOT NULL REFERENCES core.classes(id),
+        section_applied_for UUID REFERENCES core.sections(id),
+        academic_year_id UUID NOT NULL REFERENCES core.academic_years(id) ON DELETE RESTRICT,
+        track VARCHAR(50) NOT NULL,
+        status VARCHAR(50) NOT NULL DEFAULT 'PENDING_APPROVAL',
+        raised_by_user_id UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+        raised_by_role VARCHAR(50),
+        referral_teacher_id UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+        approved_by_user_id UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+        approved_by_role VARCHAR(50),
+        approved_at TIMESTAMPTZ,
+        remarks TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+"""
+# school.admission_students - created on approval; INACTIVE until activate (user + academic record)
+ADMISSION_STUDENTS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.admission_students (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        admission_request_id UUID NOT NULL REFERENCES school.admission_requests(id) ON DELETE RESTRICT UNIQUE,
+        user_id UUID REFERENCES auth.users(id) ON DELETE SET NULL UNIQUE,
+        student_name VARCHAR(255) NOT NULL,
+        parent_name VARCHAR(255),
+        mobile VARCHAR(50),
+        email VARCHAR(255),
+        class_id UUID NOT NULL REFERENCES core.classes(id),
+        section_id UUID NOT NULL REFERENCES core.sections(id),
+        academic_year_id UUID NOT NULL REFERENCES core.academic_years(id) ON DELETE RESTRICT,
+        track VARCHAR(50) NOT NULL,
+        status VARCHAR(50) NOT NULL DEFAULT 'INACTIVE',
+        joined_date DATE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+"""
+# school.audit_logs - state changes for admission/student
+AUDIT_LOGS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.audit_logs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        entity_type VARCHAR(50) NOT NULL,
+        entity_id UUID NOT NULL,
+        track VARCHAR(50),
+        from_status VARCHAR(50),
+        to_status VARCHAR(50),
+        action VARCHAR(100) NOT NULL,
+        performed_by UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+        performed_by_role VARCHAR(50),
+        timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        remarks TEXT
+    );
+"""
+
 # hrms.employee_attendance - one per employee per day
 EMPLOYEE_ATTENDANCE_TABLE: str = """
     CREATE TABLE IF NOT EXISTS hrms.employee_attendance (
@@ -707,6 +789,7 @@ async def ensure_tables(db_engine: AsyncEngine) -> None:
         await conn.execute(text(ALTER_SECTIONS_CLASS_ID))
         await conn.execute(text(ALTER_SECTIONS_DROP_OLD_UNIQUE))
         await conn.execute(text(ALTER_SECTIONS_ADD_CLASS_NAME_UNIQUE))
+        await conn.execute(text(ALTER_SECTIONS_CAPACITY))
         await conn.execute(text(ALTER_MODULES_PRICE))
         await conn.execute(text(ALTER_SUBSCRIPTION_PLANS_ORGANIZATION_TYPE))
         await conn.execute(text(ALTER_SUBSCRIPTION_PLANS_DROP_OLD_UNIQUE))
@@ -717,6 +800,17 @@ async def ensure_tables(db_engine: AsyncEngine) -> None:
         await conn.execute(text(STUDENT_ACADEMIC_RECORDS_TABLE))
         await conn.execute(text(REFERRAL_USAGE_TABLE))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_referral_usage_tenant_id ON school.referral_usage(tenant_id)"))
+        await conn.execute(text(ADMISSION_REQUESTS_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_admission_requests_tenant_id ON school.admission_requests(tenant_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_admission_requests_status ON school.admission_requests(status)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_admission_requests_created_at ON school.admission_requests(created_at)"))
+        await conn.execute(text(ADMISSION_STUDENTS_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_admission_students_tenant_id ON school.admission_students(tenant_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_admission_students_status ON school.admission_students(status)"))
+        await conn.execute(text(AUDIT_LOGS_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_audit_logs_tenant_id ON school.audit_logs(tenant_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_audit_logs_entity ON school.audit_logs(entity_type, entity_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_audit_logs_timestamp ON school.audit_logs(timestamp)"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_referral_usage_referral_code ON school.referral_usage(referral_code)"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_referral_usage_teacher_id ON school.referral_usage(teacher_id)"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_referral_usage_academic_year_id ON school.referral_usage(academic_year_id)"))
