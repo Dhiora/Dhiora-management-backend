@@ -21,6 +21,9 @@ from app.core.models.tenant import Tenant, TenantModule
 from app.core.models.admission_request import AdmissionRequest
 from app.core.models.admission_student import AdmissionStudent
 from app.core.models.audit_log import AuditLog
+from app.core.models.leave_type import LeaveType
+from app.core.models.leave_request import LeaveRequest
+from app.core.models.leave_audit_log import LeaveAuditLog
 
 __all__ = [
     "AcademicYear",
@@ -46,5 +49,8 @@ __all__ = [
     "AdmissionRequest",
     "AdmissionStudent",
     "AuditLog",
+    "LeaveType",
+    "LeaveRequest",
+    "LeaveAuditLog",
 ]
 

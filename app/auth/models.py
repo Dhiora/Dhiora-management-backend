@@ -43,7 +43,11 @@ class User(Base):
         "RefreshToken", back_populates="user", cascade="all, delete-orphan"
     )
     staff_profile = relationship(
-        "StaffProfile", back_populates="user", uselist=False, cascade="all, delete-orphan"
+        "StaffProfile",
+        back_populates="user",
+        uselist=False,
+        cascade="all, delete-orphan",
+        foreign_keys="[StaffProfile.user_id]",
     )
     student_profile = relationship(
         "StudentProfile", back_populates="user", uselist=False, cascade="all, delete-orphan"
@@ -96,11 +100,16 @@ class StaffProfile(Base):
     user_id = Column(UUID(as_uuid=True), ForeignKey("auth.users.id", ondelete="CASCADE"), nullable=False)
     employee_code = Column(String(50), nullable=True)  # Auto-generated: <ORG_CODE>-EMP-<SEQ>; not editable after creation
     department_id = Column(UUID(as_uuid=True), ForeignKey("core.departments.id"), nullable=True)
+    reporting_manager_id = Column(UUID(as_uuid=True), ForeignKey("auth.users.id", ondelete="SET NULL"), nullable=True)
     designation = Column(String(100), nullable=True)
     join_date = Column(Date, nullable=True)
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
 
-    user = relationship("User", back_populates="staff_profile")
+    user = relationship(
+        "User",
+        back_populates="staff_profile",
+        foreign_keys=[user_id],
+    )
     department_rel = relationship("Department", foreign_keys=[department_id])
 
 

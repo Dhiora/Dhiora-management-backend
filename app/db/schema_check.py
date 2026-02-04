@@ -16,6 +16,9 @@ REQUIRED_TABLES: List[Tuple[str, str]] = [
     ("school", "admission_requests"),
     ("school", "admission_students"),
     ("school", "audit_logs"),
+    ("leave", "leave_types"),
+    ("leave", "leave_requests"),
+    ("leave", "leave_audit_logs"),
     ("core", "classes"),
     ("core", "sections"),
     ("core", "tenant_modules"),
@@ -35,6 +38,7 @@ CREATE_SCHEMA_SQL: Dict[str, str] = {
     "auth": "CREATE SCHEMA IF NOT EXISTS auth;",
     "school": "CREATE SCHEMA IF NOT EXISTS school;",
     "hrms": "CREATE SCHEMA IF NOT EXISTS hrms;",
+    "leave": "CREATE SCHEMA IF NOT EXISTS leave;",
 }
 
 
@@ -325,6 +329,19 @@ ALTER_STAFF_PROFILES_DEPARTMENT_ID: str = """
             WHERE table_schema = 'auth' AND table_name = 'staff_profiles' AND column_name = 'department_id'
         ) THEN
             ALTER TABLE auth.staff_profiles ADD COLUMN department_id UUID REFERENCES core.departments(id);
+        END IF;
+    END $$;
+"""
+
+# Leave module: reporting manager for SOFTWARE tenant type (employee leave approver)
+ALTER_STAFF_PROFILES_REPORTING_MANAGER: str = """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'auth' AND table_name = 'staff_profiles' AND column_name = 'reporting_manager_id'
+        ) THEN
+            ALTER TABLE auth.staff_profiles ADD COLUMN reporting_manager_id UUID REFERENCES auth.users(id) ON DELETE SET NULL;
         END IF;
     END $$;
 """
@@ -721,6 +738,57 @@ EMPLOYEE_ATTENDANCE_TABLE: str = """
     );
 """
 
+# ----- Global Leave Management -----
+LEAVE_TYPES_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS leave.leave_types (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        name VARCHAR(100) NOT NULL,
+        code VARCHAR(50) NOT NULL,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_leave_type_tenant_code UNIQUE (tenant_id, code)
+    );
+"""
+LEAVE_REQUESTS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS leave.leave_requests (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        tenant_type VARCHAR(50) NOT NULL,
+        applicant_type VARCHAR(50) NOT NULL,
+        employee_id UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+        student_id UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+        leave_type_id UUID REFERENCES leave.leave_types(id) ON DELETE SET NULL,
+        custom_reason TEXT,
+        from_date DATE NOT NULL,
+        to_date DATE NOT NULL,
+        total_days INTEGER NOT NULL,
+        status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+        assigned_to_user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE RESTRICT,
+        approved_by_user_id UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+        approved_at TIMESTAMPTZ,
+        created_by UUID NOT NULL REFERENCES auth.users(id) ON DELETE RESTRICT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT chk_leave_request_status CHECK (status IN ('PENDING', 'APPROVED', 'REJECTED')),
+        CONSTRAINT chk_leave_applicant CHECK (
+            (applicant_type = 'EMPLOYEE' AND employee_id IS NOT NULL AND student_id IS NULL) OR
+            (applicant_type = 'STUDENT' AND student_id IS NOT NULL AND employee_id IS NULL)
+        )
+    );
+"""
+LEAVE_AUDIT_LOGS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS leave.leave_audit_logs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        leave_request_id UUID NOT NULL REFERENCES leave.leave_requests(id) ON DELETE CASCADE,
+        action VARCHAR(50) NOT NULL,
+        performed_by UUID NOT NULL REFERENCES auth.users(id) ON DELETE SET NULL,
+        performed_by_role VARCHAR(50),
+        remarks TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+"""
+
 # Drop class_id, section_id from student_profiles (after backfill)
 ALTER_STUDENT_PROFILES_DROP_CLASS_SECTION: str = """
     DO $$
@@ -785,6 +853,7 @@ async def ensure_tables(db_engine: AsyncEngine) -> None:
         await conn.execute(text(ALTER_TENANTS_ORG_SHORT_CODE))
         await conn.execute(text(ALTER_STAFF_PROFILES_EMPLOYEE_CODE))
         await conn.execute(text(ALTER_STAFF_PROFILES_DEPARTMENT_ID))
+        await conn.execute(text(ALTER_STAFF_PROFILES_REPORTING_MANAGER))
         await conn.execute(text(ALTER_STUDENT_PROFILES_CLASS_SECTION))
         await conn.execute(text(ALTER_SECTIONS_CLASS_ID))
         await conn.execute(text(ALTER_SECTIONS_DROP_OLD_UNIQUE))
@@ -817,6 +886,15 @@ async def ensure_tables(db_engine: AsyncEngine) -> None:
         await conn.execute(text(TEACHER_CLASS_ASSIGNMENTS_TABLE))
         await conn.execute(text(STUDENT_ATTENDANCE_TABLE))
         await conn.execute(text(EMPLOYEE_ATTENDANCE_TABLE))
+        await conn.execute(text(LEAVE_TYPES_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_leave_types_tenant_id ON leave.leave_types(tenant_id)"))
+        await conn.execute(text(LEAVE_REQUESTS_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_leave_requests_tenant_id ON leave.leave_requests(tenant_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_leave_requests_status ON leave.leave_requests(status)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_leave_requests_assigned_to ON leave.leave_requests(assigned_to_user_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_leave_requests_created_by ON leave.leave_requests(created_by)"))
+        await conn.execute(text(LEAVE_AUDIT_LOGS_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_leave_audit_logs_request_id ON leave.leave_audit_logs(leave_request_id)"))
         await conn.execute(text(HOMEWORKS_TABLE))
         await conn.execute(text(HOMEWORK_QUESTIONS_TABLE))
         await conn.execute(text(ALTER_HOMEWORK_QUESTIONS_QUESTION_TYPES))

@@ -16,6 +16,7 @@ from app.api.v1.modules.users.employee_router import router as employees_router
 from app.api.v1.modules.users.student_router import router as students_router
 from app.api.v1.query.query_router import router as query_router
 from app.api.v1.dropdown.dropdown_router import router as dropdown_router
+from app.api.v1.leaves.router import router as leaves_router
 
 
 def create_app() -> FastAPI:
@@ -46,6 +47,7 @@ def create_app() -> FastAPI:
     app.include_router(students_router)
     app.include_router(query_router)
     app.include_router(dropdown_router)
+    app.include_router(leaves_router)
 
     return app
 
