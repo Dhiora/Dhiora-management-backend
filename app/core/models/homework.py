@@ -52,7 +52,7 @@ class HomeworkQuestion(Base):
 
 
 class HomeworkAssignment(Base):
-    """Homework assigned to class/section. Visible to students only after assignment."""
+    """Homework assigned to class/section and subject. Visible to students only after assignment."""
 
     __tablename__ = "homework_assignments"
     __table_args__ = {"schema": "school"}
@@ -66,11 +66,17 @@ class HomeworkAssignment(Base):
     )
     class_id = Column(UUID(as_uuid=True), ForeignKey("core.classes.id"), nullable=False)
     section_id = Column(UUID(as_uuid=True), ForeignKey("core.sections.id"), nullable=True)  # NULL = entire class
+    subject_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("school.subjects.id", ondelete="RESTRICT"),
+        nullable=True,
+    )  # Required at API level; nullable for migration of existing rows
     due_date = Column(DateTime(timezone=True), nullable=False)
     assigned_by = Column(UUID(as_uuid=True), ForeignKey("auth.users.id", ondelete="RESTRICT"), nullable=False)
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
 
     homework = relationship("Homework", back_populates="assignments")
+    subject = relationship("SchoolSubject", foreign_keys=[subject_id])
     attempts = relationship("HomeworkAttempt", back_populates="assignment", cascade="all, delete-orphan")
     submissions = relationship("HomeworkSubmission", back_populates="assignment", cascade="all, delete-orphan")
 

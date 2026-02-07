@@ -15,6 +15,16 @@ from app.core.models.homework import (
 from app.core.models.department import Department
 from app.core.models.module import Module, OrganizationTypeModule
 from app.core.models.section_model import Section
+from app.core.models.subject import Subject
+from app.core.models.school_subject import SchoolSubject
+from app.core.models.class_subject import ClassSubject
+from app.core.models.teacher_subject_assignment import TeacherSubjectAssignment
+from app.core.models.timetable import Timetable
+from app.core.models.student_daily_attendance import (
+    StudentDailyAttendance,
+    StudentDailyAttendanceRecord,
+)
+from app.core.models.student_subject_attendance_override import StudentSubjectAttendanceOverride
 from app.core.models.subscription_plan import SubscriptionPlan
 from app.core.models.referral_usage import ReferralUsage
 from app.core.models.tenant import Tenant, TenantModule
@@ -40,6 +50,14 @@ __all__ = [
     "OrganizationTypeModule",
     "SchoolClass",
     "Section",
+    "Subject",
+    "SchoolSubject",
+    "ClassSubject",
+    "TeacherSubjectAssignment",
+    "Timetable",
+    "StudentDailyAttendance",
+    "StudentDailyAttendanceRecord",
+    "StudentSubjectAttendanceOverride",
     "StudentAttendance",
     "ReferralUsage",
     "SubscriptionPlan",

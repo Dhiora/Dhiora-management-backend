@@ -4,13 +4,13 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth.dependencies import get_current_user
+from app.auth.dependencies import get_current_user, require_writable_academic_year
 from app.auth.rbac import check_permission
 from app.auth.schemas import CurrentUser
 from app.core.exceptions import ServiceError
 from app.db.session import get_db
 
-from .schemas import SectionBulkCreate, SectionCreate, SectionResponse, SectionUpdate
+from .schemas import CopySectionsToYearRequest, SectionBulkCreate, SectionCreate, SectionResponse, SectionUpdate
 from . import service
 
 router = APIRouter(prefix="/api/v1/sections", tags=["sections"])
@@ -20,15 +20,18 @@ router = APIRouter(prefix="/api/v1/sections", tags=["sections"])
     "",
     response_model=SectionResponse,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(check_permission("sections", "create"))],
+    dependencies=[Depends(check_permission("sections", "create")), Depends(require_writable_academic_year)],
 )
 async def create_section(
     payload: SectionCreate,
     db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ) -> SectionResponse:
+    """Create a section for the current academic year (from token)."""
     try:
-        return await service.create_section(db, current_user.tenant_id, payload)
+        return await service.create_section(
+            db, current_user.tenant_id, current_user.academic_year_id, payload
+        )
     except ServiceError as e:
         raise HTTPException(status_code=e.status_code, detail=e.message)
 
@@ -37,16 +40,36 @@ async def create_section(
     "/bulk",
     response_model=List[SectionResponse],
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(check_permission("sections", "create"))],
+    dependencies=[Depends(check_permission("sections", "create")), Depends(require_writable_academic_year)],
 )
 async def create_sections_bulk(
     payload: SectionBulkCreate,
     db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ) -> List[SectionResponse]:
-    """Create multiple sections for a class. Body: class_id + sections list [{ name, order }]. All-or-nothing on duplicate name."""
+    """Create multiple sections for a class in the current academic year. Body: class_id + sections list [{ name, order }]."""
     try:
-        return await service.create_sections_bulk(db, current_user.tenant_id, payload)
+        return await service.create_sections_bulk(
+            db, current_user.tenant_id, current_user.academic_year_id, payload
+        )
+    except ServiceError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+
+
+@router.post(
+    "/copy-to-year",
+    response_model=List[SectionResponse],
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(check_permission("sections", "create")), Depends(require_writable_academic_year)],
+)
+async def copy_sections_to_year(
+    payload: CopySectionsToYearRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+) -> List[SectionResponse]:
+    """Copy all sections from one academic year to another (e.g. when year ends). Old data remains unchanged; new section rows created for target year."""
+    try:
+        return await service.copy_sections_to_academic_year(db, current_user.tenant_id, payload)
     except ServiceError as e:
         raise HTTPException(status_code=e.status_code, detail=e.message)
 
@@ -59,10 +82,18 @@ async def create_sections_bulk(
 async def list_sections(
     active_only: bool = Query(True, description="Return only is_active=true by default"),
     class_id: Optional[UUID] = Query(None, description="Filter by class (sections under this class)"),
+    academic_year_id: Optional[UUID] = Query(None, description="Filter by academic year; default = current from token"),
     db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ) -> List[SectionResponse]:
-    return await service.list_sections(db, current_user.tenant_id, active_only=active_only, class_id=class_id)
+    """List sections. Uses current academic year from token unless academic_year_id query param is provided."""
+    return await service.list_sections(
+        db,
+        current_user.tenant_id,
+        academic_year_id=academic_year_id or current_user.academic_year_id,
+        active_only=active_only,
+        class_id=class_id,
+    )
 
 
 @router.get(
@@ -84,7 +115,7 @@ async def get_section(
 @router.put(
     "/{section_id}",
     response_model=SectionResponse,
-    dependencies=[Depends(check_permission("sections", "update"))],
+    dependencies=[Depends(check_permission("sections", "update")), Depends(require_writable_academic_year)],
 )
 async def update_section(
     section_id: UUID,

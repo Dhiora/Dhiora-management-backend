@@ -101,6 +101,7 @@ class HomeworkAssignmentCreate(BaseModel):
     academic_year_id: UUID
     class_id: UUID
     section_id: Optional[UUID] = None
+    subject_id: UUID = Field(..., description="Subject (school.subjects) for this assignment; must be in class_subjects for the year")
     due_date: datetime = Field(..., description="Must be in future")
 
 
@@ -110,6 +111,7 @@ class HomeworkAssignmentResponse(BaseModel):
     academic_year_id: UUID
     class_id: UUID
     section_id: Optional[UUID] = None
+    subject_id: Optional[UUID] = None
     due_date: datetime
     assigned_by: UUID
     created_at: datetime

@@ -35,6 +35,7 @@ class SectionResponse(BaseModel):
     id: UUID
     tenant_id: UUID
     class_id: UUID
+    academic_year_id: Optional[UUID] = None
     name: str
     display_order: Optional[int] = None
     capacity: int = Field(..., description="Max students per section")
@@ -45,3 +46,9 @@ class SectionResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class CopySectionsToYearRequest(BaseModel):
+    """Copy all sections from source academic year to target academic year (e.g. when year ends). Old data unchanged."""
+    source_academic_year_id: UUID = Field(..., description="Year to copy from (e.g. ending year)")
+    target_academic_year_id: UUID = Field(..., description="Year to copy into (e.g. new year)")

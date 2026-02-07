@@ -181,3 +181,16 @@ If students existed before this design:
 4. Drop `class_id`, `section_id` from `auth.student_profiles`
 
 Migration is idempotent (safe to re-run).
+
+---
+
+## 8. Sections and Academic Year
+
+Sections are **per academic year**: each section row has `academic_year_id`. The same class can have "Section A" in 2024-25 and "Section A" in 2025-26 as separate rows.
+
+- **Creating sections:** Section create/bulk use the **current academic year from the token**. No academic year in request body; `require_writable_academic_year` is enforced.
+- **Listing sections:** Default filter is current academic year from token. Optional `academic_year_id` query param can list sections for another year.
+- **When academic year ends:** Use **copy-to-year** to create sections for the new year without touching old data:
+  - **`POST /api/v1/sections/copy-to-year`**  
+  - Body: `{ "source_academic_year_id": "...", "target_academic_year_id": "..." }`  
+  - Creates new section rows for the target year (same class, name, capacity, display_order). Old sections and all linked data (enrollments, attendance, etc.) remain unchanged.

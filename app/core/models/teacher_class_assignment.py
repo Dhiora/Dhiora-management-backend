@@ -9,7 +9,9 @@ from app.db.session import Base
 
 
 class TeacherClassAssignment(Base):
-    """Links teacher to class-section for an academic year. Used for attendance scope."""
+    """Links teacher to class-section (and optionally subject) for an academic year.
+    subject_id NULL = can mark daily attendance only; set = can mark subject overrides for that subject.
+    """
 
     __tablename__ = "teacher_class_assignments"
     __table_args__ = {"schema": "school"}
@@ -23,9 +25,15 @@ class TeacherClassAssignment(Base):
         ForeignKey("core.academic_years.id", ondelete="CASCADE"),
         nullable=False,
     )
+    subject_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("core.subjects.id", ondelete="CASCADE"),
+        nullable=True,
+    )
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
 
     teacher = relationship("User", foreign_keys=[teacher_id])
     school_class = relationship("SchoolClass", foreign_keys=[class_id])
     section = relationship("Section", foreign_keys=[section_id])
     academic_year = relationship("AcademicYear", foreign_keys=[academic_year_id])
+    subject = relationship("Subject", foreign_keys=[subject_id])

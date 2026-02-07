@@ -117,13 +117,26 @@ CREATE_TABLE_SQL: Dict[Tuple[str, str], str] = {
             id UUID PRIMARY KEY,
             tenant_id UUID NOT NULL REFERENCES core.tenants(id),
             class_id UUID NOT NULL REFERENCES core.classes(id),
+            academic_year_id UUID NOT NULL REFERENCES core.academic_years(id) ON DELETE RESTRICT,
             name VARCHAR(50) NOT NULL,
             display_order INTEGER,
             capacity INTEGER NOT NULL DEFAULT 50,
             is_active BOOLEAN NOT NULL DEFAULT TRUE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            CONSTRAINT uq_section_class_name UNIQUE (class_id, name)
+            CONSTRAINT uq_section_class_ay_name UNIQUE (class_id, academic_year_id, name)
+        );
+    """,
+    ("core", "subjects"): """
+        CREATE TABLE IF NOT EXISTS core.subjects (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+            name VARCHAR(255) NOT NULL,
+            code VARCHAR(50) NOT NULL,
+            display_order INTEGER,
+            is_active BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT uq_subject_tenant_code UNIQUE (tenant_id, code)
         );
     """,
     ("core", "tenant_modules"): """
@@ -408,6 +421,48 @@ ALTER_SECTIONS_CAPACITY: str = """
     END $$;
 """
 
+# Sections: add academic_year_id (sections are per class per academic year; copy to new year when year ends)
+ALTER_SECTIONS_ACADEMIC_YEAR_ID: str = """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'core' AND table_name = 'sections' AND column_name = 'academic_year_id'
+        ) THEN
+            ALTER TABLE core.sections ADD COLUMN academic_year_id UUID REFERENCES core.academic_years(id) ON DELETE RESTRICT;
+        END IF;
+    END $$;
+"""
+
+# Backfill academic_year_id: set to tenant's current academic year (or first by start_date) for existing sections
+ALTER_SECTIONS_BACKFILL_ACADEMIC_YEAR: str = """
+    UPDATE core.sections s
+    SET academic_year_id = (
+        SELECT ay.id FROM core.academic_years ay
+        WHERE ay.tenant_id = s.tenant_id
+        ORDER BY ay.is_current DESC NULLS LAST, ay.start_date DESC
+        LIMIT 1
+    )
+    WHERE s.academic_year_id IS NULL;
+"""
+
+# Switch unique from (class_id, name) to (class_id, academic_year_id, name)
+ALTER_SECTIONS_DROP_CLASS_NAME_UNIQUE: str = """
+    ALTER TABLE core.sections DROP CONSTRAINT IF EXISTS uq_section_class_name;
+"""
+ALTER_SECTIONS_ADD_CLASS_AY_NAME_UNIQUE: str = """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = 'uq_section_class_ay_name'
+              AND conrelid = 'core.sections'::regclass
+        ) THEN
+            ALTER TABLE core.sections ADD CONSTRAINT uq_section_class_ay_name UNIQUE (class_id, academic_year_id, name);
+        END IF;
+    END $$;
+"""
+
 # Add price column to core.modules (for existing DBs)
 ALTER_MODULES_PRICE: str = """
     DO $$
@@ -565,6 +620,185 @@ STUDENT_ATTENDANCE_TABLE: str = """
     );
 """
 
+# ----- Daily + Subject Override Attendance -----
+# school.student_daily_attendance - one per class/section/date (master)
+STUDENT_DAILY_ATTENDANCE_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.student_daily_attendance (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        academic_year_id UUID NOT NULL REFERENCES core.academic_years(id) ON DELETE RESTRICT,
+        class_id UUID NOT NULL REFERENCES core.classes(id),
+        section_id UUID NOT NULL REFERENCES core.sections(id),
+        attendance_date DATE NOT NULL,
+        marked_by UUID NOT NULL REFERENCES auth.users(id) ON DELETE RESTRICT,
+        status VARCHAR(20) NOT NULL DEFAULT 'DRAFT',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_daily_attendance_class_section_date UNIQUE (academic_year_id, class_id, section_id, attendance_date),
+        CONSTRAINT chk_daily_attendance_status CHECK (status IN ('DRAFT', 'SUBMITTED', 'LOCKED'))
+    );
+"""
+# school.student_daily_attendance_records - one per student per daily master
+STUDENT_DAILY_ATTENDANCE_RECORDS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.student_daily_attendance_records (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        daily_attendance_id UUID NOT NULL REFERENCES school.student_daily_attendance(id) ON DELETE CASCADE,
+        student_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+        status VARCHAR(20) NOT NULL,
+        CONSTRAINT uq_daily_record_student UNIQUE (daily_attendance_id, student_id),
+        CONSTRAINT chk_daily_record_status CHECK (status IN ('PRESENT', 'ABSENT', 'LATE', 'HALF_DAY', 'LEAVE'))
+    );
+"""
+# school.student_subject_attendance_overrides - subject override per student per daily master (subject_id → school.subjects)
+STUDENT_SUBJECT_ATTENDANCE_OVERRIDES_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.student_subject_attendance_overrides (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        daily_attendance_id UUID NOT NULL REFERENCES school.student_daily_attendance(id) ON DELETE CASCADE,
+        subject_id UUID NOT NULL REFERENCES school.subjects(id) ON DELETE CASCADE,
+        student_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+        override_status VARCHAR(20) NOT NULL,
+        reason TEXT,
+        marked_by UUID NOT NULL REFERENCES auth.users(id) ON DELETE RESTRICT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_subject_override_daily_subject_student UNIQUE (daily_attendance_id, subject_id, student_id),
+        CONSTRAINT chk_override_status CHECK (override_status IN ('PRESENT', 'ABSENT', 'LATE', 'HALF_DAY', 'LEAVE'))
+    );
+"""
+
+# Add subject_id to teacher_class_assignments (nullable; for subject-wise override scope)
+ALTER_TEACHER_CLASS_ASSIGNMENTS_SUBJECT_ID: str = """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'school' AND table_name = 'teacher_class_assignments' AND column_name = 'subject_id'
+        ) THEN
+            ALTER TABLE school.teacher_class_assignments ADD COLUMN subject_id UUID REFERENCES core.subjects(id) ON DELETE CASCADE;
+        END IF;
+    END $$;
+"""
+# Optional: unique including subject_id (allows same teacher/class/section/year for multiple subjects)
+ALTER_TEACHER_CLASS_ASSIGNMENTS_UNIQUE_WITH_SUBJECT: str = """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint c
+            JOIN pg_class t ON c.conrelid = t.oid
+            JOIN pg_namespace n ON t.relnamespace = n.oid
+            WHERE n.nspname = 'school' AND t.relname = 'teacher_class_assignments' AND c.conname = 'uq_teacher_class_section_year_subject'
+        ) THEN
+            ALTER TABLE school.teacher_class_assignments DROP CONSTRAINT IF EXISTS uq_teacher_class_section_year;
+            ALTER TABLE school.teacher_class_assignments ADD CONSTRAINT uq_teacher_class_section_year_subject
+                UNIQUE (teacher_id, class_id, section_id, academic_year_id, subject_id);
+        END IF;
+    EXCEPTION
+        WHEN others THEN NULL;
+    END $$;
+"""
+
+# ----- Dhiora: school.subjects (year-agnostic, department_id → core.departments), class_subjects, teacher_subject_assignments, timetables -----
+SCHOOL_SUBJECTS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.subjects (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        department_id UUID NOT NULL REFERENCES core.departments(id) ON DELETE RESTRICT,
+        name VARCHAR(255) NOT NULL,
+        code VARCHAR(50) NOT NULL,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        display_order INTEGER,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_school_subject_tenant_code UNIQUE (tenant_id, code)
+    );
+"""
+# For existing DBs that had school.subjects.department_id → school.departments: point to core.departments
+ALTER_SUBJECTS_DEPARTMENT_TO_CORE: str = """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'school' AND table_name = 'subjects') THEN
+            RETURN;
+        END IF;
+        ALTER TABLE school.subjects DROP CONSTRAINT IF EXISTS school_subjects_department_id_fkey;
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint c
+            JOIN pg_class t ON c.conrelid = t.oid
+            JOIN pg_namespace n ON t.relnamespace = n.oid
+            WHERE n.nspname = 'school' AND t.relname = 'subjects'
+              AND c.conname = 'fk_school_subjects_department_core'
+        ) THEN
+            ALTER TABLE school.subjects
+                ADD CONSTRAINT fk_school_subjects_department_core FOREIGN KEY (department_id) REFERENCES core.departments(id) ON DELETE RESTRICT;
+        END IF;
+    EXCEPTION
+        WHEN others THEN NULL;
+    END $$;
+"""
+CLASS_SUBJECTS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.class_subjects (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        academic_year_id UUID NOT NULL REFERENCES core.academic_years(id) ON DELETE RESTRICT,
+        class_id UUID NOT NULL REFERENCES core.classes(id),
+        subject_id UUID NOT NULL REFERENCES school.subjects(id) ON DELETE CASCADE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_class_subjects_ay_class_subject UNIQUE (academic_year_id, class_id, subject_id)
+    );
+"""
+TEACHER_SUBJECT_ASSIGNMENTS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.teacher_subject_assignments (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        academic_year_id UUID NOT NULL REFERENCES core.academic_years(id) ON DELETE CASCADE,
+        teacher_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+        class_id UUID NOT NULL REFERENCES core.classes(id),
+        section_id UUID NOT NULL REFERENCES core.sections(id),
+        subject_id UUID NOT NULL REFERENCES school.subjects(id) ON DELETE CASCADE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_teacher_subject_assignment UNIQUE (academic_year_id, teacher_id, class_id, section_id, subject_id)
+    );
+"""
+TIMETABLES_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.timetables (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        academic_year_id UUID NOT NULL REFERENCES core.academic_years(id) ON DELETE RESTRICT,
+        class_id UUID NOT NULL REFERENCES core.classes(id),
+        section_id UUID NOT NULL REFERENCES core.sections(id),
+        subject_id UUID NOT NULL REFERENCES school.subjects(id) ON DELETE CASCADE,
+        teacher_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE RESTRICT,
+        day_of_week INTEGER NOT NULL,
+        start_time TIME NOT NULL,
+        end_time TIME NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT chk_timetable_day_of_week CHECK (day_of_week >= 0 AND day_of_week <= 6)
+    );
+"""
+
+# Overrides: ensure FK to school.subjects. For existing DBs that had FK to core.subjects, drop and re-add.
+ALTER_OVERRIDES_FK_TO_SCHOOL_SUBJECTS: str = """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'school' AND table_name = 'subjects') THEN
+            RETURN;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'school' AND table_name = 'student_subject_attendance_overrides') THEN
+            RETURN;
+        END IF;
+        ALTER TABLE school.student_subject_attendance_overrides DROP CONSTRAINT IF EXISTS student_subject_attendance_overrides_subject_id_fkey;
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint c
+            JOIN pg_class t ON c.conrelid = t.oid
+            JOIN pg_namespace n ON t.relnamespace = n.oid
+            WHERE n.nspname = 'school' AND t.relname = 'student_subject_attendance_overrides'
+              AND c.conname = 'fk_overrides_school_subject'
+        ) THEN
+            ALTER TABLE school.student_subject_attendance_overrides
+                ADD CONSTRAINT fk_overrides_school_subject FOREIGN KEY (subject_id) REFERENCES school.subjects(id) ON DELETE CASCADE;
+        END IF;
+    EXCEPTION
+        WHEN others THEN NULL;
+    END $$;
+"""
+
 # ----- Homework Management -----
 HOMEWORKS_TABLE: str = """
     CREATE TABLE IF NOT EXISTS school.homeworks (
@@ -617,10 +851,49 @@ HOMEWORK_ASSIGNMENTS_TABLE: str = """
         academic_year_id UUID NOT NULL REFERENCES core.academic_years(id) ON DELETE RESTRICT,
         class_id UUID NOT NULL REFERENCES core.classes(id),
         section_id UUID REFERENCES core.sections(id),
+        subject_id UUID NOT NULL REFERENCES school.subjects(id) ON DELETE RESTRICT,
         due_date TIMESTAMPTZ NOT NULL,
         assigned_by UUID NOT NULL REFERENCES auth.users(id) ON DELETE RESTRICT,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+"""
+# Existing DBs: add subject_id if missing (nullable first for backfill; app requires it on create)
+ALTER_HOMEWORK_ASSIGNMENTS_SUBJECT_ID: str = """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'school'
+              AND table_name = 'homework_assignments'
+              AND column_name = 'subject_id'
+        ) THEN
+            ALTER TABLE school.homework_assignments
+            ADD COLUMN subject_id UUID REFERENCES school.subjects(id) ON DELETE RESTRICT;
+        END IF;
+    END $$;
+"""
+# Optional: make subject_id NOT NULL after backfill (skip if you have existing rows with NULL)
+# Here we do not force NOT NULL so existing rows are not broken; new assignments require subject_id in app.
+IX_HOMEWORK_ASSIGNMENTS_SUBJECT_ID: str = """
+    CREATE INDEX IF NOT EXISTS ix_homework_assignments_subject_id ON school.homework_assignments(subject_id);
+"""
+UQ_HOMEWORK_ASSIGNMENT_CONTEXT: str = """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint c
+            JOIN pg_class t ON c.conrelid = t.oid
+            JOIN pg_namespace n ON t.relnamespace = n.oid
+            WHERE n.nspname = 'school' AND t.relname = 'homework_assignments'
+              AND c.conname = 'uq_homework_assignment_context'
+        ) THEN
+            ALTER TABLE school.homework_assignments
+            ADD CONSTRAINT uq_homework_assignment_context
+            UNIQUE (homework_id, academic_year_id, class_id, section_id, subject_id);
+        END IF;
+    EXCEPTION
+        WHEN others THEN NULL;
+    END $$;
 """
 
 HOMEWORK_ATTEMPTS_TABLE: str = """
@@ -821,6 +1094,7 @@ async def ensure_tables(db_engine: AsyncEngine) -> None:
             ("core", "departments"),
             ("core", "classes"),
             ("core", "sections"),
+            ("core", "subjects"),
             ("core", "tenant_modules"),
             ("core", "modules"),
             ("core", "organization_type_modules"),
@@ -859,6 +1133,10 @@ async def ensure_tables(db_engine: AsyncEngine) -> None:
         await conn.execute(text(ALTER_SECTIONS_DROP_OLD_UNIQUE))
         await conn.execute(text(ALTER_SECTIONS_ADD_CLASS_NAME_UNIQUE))
         await conn.execute(text(ALTER_SECTIONS_CAPACITY))
+        await conn.execute(text(ALTER_SECTIONS_ACADEMIC_YEAR_ID))
+        await conn.execute(text(ALTER_SECTIONS_BACKFILL_ACADEMIC_YEAR))
+        await conn.execute(text(ALTER_SECTIONS_DROP_CLASS_NAME_UNIQUE))
+        await conn.execute(text(ALTER_SECTIONS_ADD_CLASS_AY_NAME_UNIQUE))
         await conn.execute(text(ALTER_MODULES_PRICE))
         await conn.execute(text(ALTER_SUBSCRIPTION_PLANS_ORGANIZATION_TYPE))
         await conn.execute(text(ALTER_SUBSCRIPTION_PLANS_DROP_OLD_UNIQUE))
@@ -884,7 +1162,25 @@ async def ensure_tables(db_engine: AsyncEngine) -> None:
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_referral_usage_teacher_id ON school.referral_usage(teacher_id)"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_referral_usage_academic_year_id ON school.referral_usage(academic_year_id)"))
         await conn.execute(text(TEACHER_CLASS_ASSIGNMENTS_TABLE))
+        await conn.execute(text(ALTER_TEACHER_CLASS_ASSIGNMENTS_SUBJECT_ID))
+        await conn.execute(text(ALTER_TEACHER_CLASS_ASSIGNMENTS_UNIQUE_WITH_SUBJECT))
+        await conn.execute(text(SCHOOL_SUBJECTS_TABLE))
+        await conn.execute(text(ALTER_SUBJECTS_DEPARTMENT_TO_CORE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_school_subjects_tenant ON school.subjects(tenant_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_school_subjects_department ON school.subjects(department_id)"))
+        await conn.execute(text(CLASS_SUBJECTS_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_class_subjects_ay ON school.class_subjects(academic_year_id)"))
+        await conn.execute(text(TEACHER_SUBJECT_ASSIGNMENTS_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_teacher_subject_assignments_teacher ON school.teacher_subject_assignments(teacher_id)"))
+        await conn.execute(text(TIMETABLES_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_timetables_ay_class_section ON school.timetables(academic_year_id, class_id, section_id)"))
         await conn.execute(text(STUDENT_ATTENDANCE_TABLE))
+        await conn.execute(text(STUDENT_DAILY_ATTENDANCE_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_student_daily_attendance_tenant_date ON school.student_daily_attendance(tenant_id, attendance_date)"))
+        await conn.execute(text(STUDENT_DAILY_ATTENDANCE_RECORDS_TABLE))
+        await conn.execute(text(STUDENT_SUBJECT_ATTENDANCE_OVERRIDES_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_student_subject_overrides_tenant ON school.student_subject_attendance_overrides(tenant_id)"))
+        await conn.execute(text(ALTER_OVERRIDES_FK_TO_SCHOOL_SUBJECTS))
         await conn.execute(text(EMPLOYEE_ATTENDANCE_TABLE))
         await conn.execute(text(LEAVE_TYPES_TABLE))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_leave_types_tenant_id ON leave.leave_types(tenant_id)"))
@@ -899,6 +1195,9 @@ async def ensure_tables(db_engine: AsyncEngine) -> None:
         await conn.execute(text(HOMEWORK_QUESTIONS_TABLE))
         await conn.execute(text(ALTER_HOMEWORK_QUESTIONS_QUESTION_TYPES))
         await conn.execute(text(HOMEWORK_ASSIGNMENTS_TABLE))
+        await conn.execute(text(ALTER_HOMEWORK_ASSIGNMENTS_SUBJECT_ID))
+        await conn.execute(text(IX_HOMEWORK_ASSIGNMENTS_SUBJECT_ID))
+        await conn.execute(text(UQ_HOMEWORK_ASSIGNMENT_CONTEXT))
         await conn.execute(text(HOMEWORK_ATTEMPTS_TABLE))
         await conn.execute(text(HOMEWORK_SUBMISSIONS_TABLE))
         await conn.execute(text(HOMEWORK_HINT_USAGE_TABLE))

@@ -1,4 +1,4 @@
-"""Tenant-scoped sections (e.g. A, B, C) under a class. Section name is unique per class."""
+"""Tenant-scoped sections (e.g. A, B, C) under a class, per academic year. Section name is unique per class per year."""
 import uuid
 from datetime import datetime
 
@@ -10,17 +10,22 @@ from app.db.session import Base
 
 
 class Section(Base):
-    """Section belongs to a class (e.g. Class 1st has sections A, B, C). Soft delete via is_active."""
+    """Section belongs to a class and academic year (e.g. Class 1st Section A for 2025-26). Copy to new year when year ends."""
 
     __tablename__ = "sections"
     __table_args__ = (
-        UniqueConstraint("class_id", "name", name="uq_section_class_name"),
+        UniqueConstraint("class_id", "academic_year_id", "name", name="uq_section_class_ay_name"),
         {"schema": "core"},
     )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("core.tenants.id"), nullable=False)
     class_id = Column(UUID(as_uuid=True), ForeignKey("core.classes.id"), nullable=False)
+    academic_year_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("core.academic_years.id", ondelete="RESTRICT"),
+        nullable=True,  # nullable for existing DBs until backfilled
+    )
     name = Column(String(50), nullable=False)
     display_order = Column(Integer, nullable=True)
     capacity = Column(Integer, nullable=False, default=50)
@@ -30,3 +35,4 @@ class Section(Base):
 
     tenant = relationship("Tenant", backref="sections")
     school_class = relationship("SchoolClass", backref="sections", foreign_keys=[class_id])
+    academic_year = relationship("AcademicYear", backref="sections", foreign_keys=[academic_year_id])

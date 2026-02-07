@@ -18,9 +18,10 @@ Homework creation (teacher), assignment to class/section, student attempts, subm
 - Hints: `[{type: "TEXT"|"VIDEO_LINK", content, title?}]`
 
 ### school.homework_assignments
-- id, homework_id, academic_year_id, class_id, section_id (nullable)
+- id, homework_id, academic_year_id, class_id, section_id (nullable), **subject_id** (required at API)
 - due_date, assigned_by
-- section_id NULL = entire class
+- section_id NULL = entire class. **subject_id** links to school.subjects (subject only at assignment level).
+- UNIQUE (homework_id, academic_year_id, class_id, section_id, subject_id) to prevent duplicate context.
 
 ### school.homework_attempts
 - id, homework_assignment_id, student_id
@@ -84,7 +85,7 @@ Roles need `homework` permissions: `create`, `read`, `update`, `delete`
 
 - Homework editable only when DRAFT
 - Questions/hints locked after assignment
-- Assignment: academic year ACTIVE, due_date in future
+- **Assignment:** academic year ACTIVE; due_date in future; **subject_id** required (subject from school.subjects). Subject must be in class_subjects for that academic year and class. Teachers can assign only for a subject they are assigned to (teacher_subject_assignments) for that class/section.
 - Restart: requires restart_reason
 - One submission per attempt
 - Videos: external links only (no upload)

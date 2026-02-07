@@ -11,7 +11,7 @@ from app.core.models import AcademicYear, Section, StudentAcademicRecord
 
 from app.api.v1.classes import service as class_service
 
-from .schemas import SectionBulkCreate, SectionCreate, SectionResponse, SectionUpdate
+from .schemas import CopySectionsToYearRequest, SectionBulkCreate, SectionCreate, SectionResponse, SectionUpdate
 
 
 def _to_uuid(val):
@@ -26,6 +26,7 @@ def _section_to_response(s: Section, occupied: int = 0) -> SectionResponse:
         id=_to_uuid(s.id),
         tenant_id=_to_uuid(s.tenant_id),
         class_id=_to_uuid(s.class_id),
+        academic_year_id=_to_uuid(getattr(s, "academic_year_id", None)),
         name=s.name,
         display_order=s.display_order,
         capacity=capacity,
@@ -39,17 +40,25 @@ def _section_to_response(s: Section, occupied: int = 0) -> SectionResponse:
 async def create_section(
     db: AsyncSession,
     tenant_id: UUID,
+    academic_year_id: UUID,
     payload: SectionCreate,
 ) -> SectionResponse:
+    if not academic_year_id:
+        raise ServiceError("Academic year is required to create a section (use current year from token)", status.HTTP_400_BAD_REQUEST)
     school_class = await class_service.get_class_by_id_for_tenant(db, tenant_id, payload.class_id, active_only=True)
     if not school_class:
         raise ServiceError("Invalid or inactive class for this tenant", status.HTTP_400_BAD_REQUEST)
+    # Ensure academic year belongs to tenant
+    ay = await db.get(AcademicYear, academic_year_id)
+    if not ay or ay.tenant_id != tenant_id:
+        raise ServiceError("Invalid or inactive academic year for this tenant", status.HTTP_400_BAD_REQUEST)
     name = payload.name.strip()
     capacity = getattr(payload, "capacity", 50) or 50
     try:
         obj = Section(
             tenant_id=tenant_id,
             class_id=payload.class_id,
+            academic_year_id=academic_year_id,
             name=name,
             display_order=payload.display_order,
             capacity=capacity,
@@ -61,18 +70,24 @@ async def create_section(
         return _section_to_response(obj, occupied=0)
     except IntegrityError:
         await db.rollback()
-        raise ServiceError("Section name already exists for this class", status.HTTP_409_CONFLICT)
+        raise ServiceError("Section name already exists for this class in this academic year", status.HTTP_409_CONFLICT)
 
 
 async def create_sections_bulk(
     db: AsyncSession,
     tenant_id: UUID,
+    academic_year_id: UUID,
     payload: SectionBulkCreate,
 ) -> List[SectionResponse]:
     """Create multiple sections for a class in one request. All-or-nothing: rollback on first duplicate name."""
+    if not academic_year_id:
+        raise ServiceError("Academic year is required to create sections (use current year from token)", status.HTTP_400_BAD_REQUEST)
     school_class = await class_service.get_class_by_id_for_tenant(db, tenant_id, payload.class_id, active_only=True)
     if not school_class:
         raise ServiceError("Invalid or inactive class for this tenant", status.HTTP_400_BAD_REQUEST)
+    ay = await db.get(AcademicYear, academic_year_id)
+    if not ay or ay.tenant_id != tenant_id:
+        raise ServiceError("Invalid or inactive academic year for this tenant", status.HTTP_400_BAD_REQUEST)
     try:
         created = []
         for item in payload.sections:
@@ -80,6 +95,7 @@ async def create_sections_bulk(
             obj = Section(
                 tenant_id=tenant_id,
                 class_id=payload.class_id,
+                academic_year_id=academic_year_id,
                 name=item.name.strip(),
                 display_order=item.order,
                 capacity=capacity,
@@ -94,7 +110,7 @@ async def create_sections_bulk(
         return [_section_to_response(s, occupied=0) for s in created]
     except IntegrityError:
         await db.rollback()
-        raise ServiceError("Section name already exists for this class (duplicate in bulk or existing)", status.HTTP_409_CONFLICT)
+        raise ServiceError("Section name already exists for this class in this academic year (duplicate in bulk or existing)", status.HTTP_409_CONFLICT)
 
 
 async def _get_current_academic_year_id(db: AsyncSession, tenant_id: UUID) -> Optional[UUID]:
@@ -132,10 +148,14 @@ async def _get_occupied_by_section(
 async def list_sections(
     db: AsyncSession,
     tenant_id: UUID,
+    academic_year_id: Optional[UUID] = None,
     active_only: bool = True,
     class_id: Optional[UUID] = None,
 ) -> List[SectionResponse]:
+    """List sections for tenant. Default academic_year_id = current year from token; pass explicitly to list another year."""
     stmt = select(Section).where(Section.tenant_id == tenant_id)
+    if academic_year_id is not None:
+        stmt = stmt.where(Section.academic_year_id == academic_year_id)
     if class_id is not None:
         stmt = stmt.where(Section.class_id == class_id)
     if active_only:
@@ -144,7 +164,7 @@ async def list_sections(
     result = await db.execute(stmt)
     rows = result.scalars().all()
     section_ids = [s.id for s in rows]
-    ay_id = await _get_current_academic_year_id(db, tenant_id)
+    ay_id = academic_year_id or await _get_current_academic_year_id(db, tenant_id)
     occupied_map: Dict[UUID, int] = {}
     if ay_id and section_ids:
         occupied_map = await _get_occupied_by_section(db, ay_id, section_ids)
@@ -155,6 +175,7 @@ async def get_section(
     db: AsyncSession,
     tenant_id: UUID,
     section_id: UUID,
+    academic_year_id: Optional[UUID] = None,
 ) -> Optional[SectionResponse]:
     result = await db.execute(
         select(Section).where(
@@ -165,7 +186,7 @@ async def get_section(
     obj = result.scalar_one_or_none()
     if not obj:
         return None
-    ay_id = await _get_current_academic_year_id(db, tenant_id)
+    ay_id = academic_year_id or getattr(obj, "academic_year_id", None) or await _get_current_academic_year_id(db, tenant_id)
     occupied = 0
     if ay_id:
         occupied_map = await _get_occupied_by_section(db, ay_id, [obj.id])
@@ -241,12 +262,70 @@ async def get_section_by_id_for_tenant(
     tenant_id: UUID,
     section_id: UUID,
     active_only: bool = True,
+    academic_year_id: Optional[UUID] = None,
 ) -> Optional[Section]:
     stmt = select(Section).where(
         Section.id == section_id,
         Section.tenant_id == tenant_id,
     )
+    if academic_year_id is not None:
+        stmt = stmt.where(Section.academic_year_id == academic_year_id)
     if active_only:
         stmt = stmt.where(Section.is_active.is_(True))
     result = await db.execute(stmt)
     return result.scalar_one_or_none()
+
+
+async def copy_sections_to_academic_year(
+    db: AsyncSession,
+    tenant_id: UUID,
+    payload: CopySectionsToYearRequest,
+) -> List[SectionResponse]:
+    """
+    Copy all sections from source academic year to target academic year (e.g. when year ends).
+    Creates new section rows with same class_id, name, capacity, display_order; old data remains unchanged.
+    """
+    ay_source = await db.get(AcademicYear, payload.source_academic_year_id)
+    ay_target = await db.get(AcademicYear, payload.target_academic_year_id)
+    if not ay_source or ay_source.tenant_id != tenant_id:
+        raise ServiceError("Source academic year not found or does not belong to this tenant", status.HTTP_404_NOT_FOUND)
+    if not ay_target or ay_target.tenant_id != tenant_id:
+        raise ServiceError("Target academic year not found or does not belong to this tenant", status.HTTP_404_NOT_FOUND)
+    if payload.source_academic_year_id == payload.target_academic_year_id:
+        raise ServiceError("Source and target academic year must be different", status.HTTP_400_BAD_REQUEST)
+
+    stmt = select(Section).where(
+        Section.tenant_id == tenant_id,
+        Section.academic_year_id == payload.source_academic_year_id,
+        Section.is_active.is_(True),
+    ).order_by(Section.class_id, Section.display_order.nullslast(), Section.name)
+    result = await db.execute(stmt)
+    source_sections = result.scalars().all()
+    if not source_sections:
+        return []
+
+    created = []
+    try:
+        for s in source_sections:
+            new_section = Section(
+                tenant_id=tenant_id,
+                class_id=s.class_id,
+                academic_year_id=payload.target_academic_year_id,
+                name=s.name,
+                display_order=s.display_order,
+                capacity=getattr(s, "capacity", 50) or 50,
+                is_active=True,
+            )
+            db.add(new_section)
+            await db.flush()
+            created.append(new_section)
+        await db.commit()
+        for obj in created:
+            await db.refresh(obj)
+        return [_section_to_response(s, occupied=0) for s in created]
+    except IntegrityError:
+        await db.rollback()
+        raise ServiceError(
+            "One or more sections already exist for the target academic year (same class and name). Copy aborted.",
+            status.HTTP_409_CONFLICT,
+        )

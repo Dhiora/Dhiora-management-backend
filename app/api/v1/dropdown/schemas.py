@@ -6,6 +6,15 @@ from uuid import UUID
 from pydantic import BaseModel, Field
 
 
+class AcademicYearDropdownItem(BaseModel):
+    """Academic year (indicator=AY)."""
+    academicYearId: UUID = Field(..., description="Academic year UUID")
+    academicYearName: str = Field(..., description="Academic year name (e.g. 2025-2026)")
+
+    class Config:
+        populate_by_name = True
+
+
 class SectionDropdownItem(BaseModel):
     sectionName: str = Field(..., description="Section name (e.g. A, B, C)")
     sectionId: UUID = Field(..., description="Section UUID")

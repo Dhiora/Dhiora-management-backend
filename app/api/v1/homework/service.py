@@ -18,9 +18,12 @@ from app.core.models import (
     HomeworkAttempt,
     HomeworkHintUsage,
     HomeworkQuestion,
+    SchoolSubject,
     HomeworkSubmission,
     StudentAcademicRecord,
 )
+from app.api.v1.class_subjects import service as class_subjects_service
+from app.api.v1.teacher_subject_assignments import service as teacher_subject_assignments_service
 
 from .schemas import (
     HomeworkAssignmentCreate,
@@ -362,11 +365,33 @@ async def create_assignment(
         sec = await section_service.get_section_by_id_for_tenant(db, tenant_id, payload.section_id, active_only=True)
         if not sec or sec.class_id != payload.class_id:
             raise ServiceError("Section not found or does not belong to class", status.HTTP_400_BAD_REQUEST)
+    # Subject: must exist, be active, and be in class_subjects for this academic year and class
+    subj = await db.get(SchoolSubject, payload.subject_id)
+    if not subj or subj.tenant_id != tenant_id:
+        raise ServiceError("Subject not found", status.HTTP_404_NOT_FOUND)
+    if not subj.is_active:
+        raise ServiceError("Subject is not active", status.HTTP_400_BAD_REQUEST)
+    if not await class_subjects_service.check_subject_in_class_for_year(
+        db, tenant_id, payload.academic_year_id, payload.class_id, payload.subject_id
+    ):
+        raise ServiceError(
+            "Subject must be assigned to this class for this academic year (class_subjects) before assigning homework",
+            status.HTTP_400_BAD_REQUEST,
+        )
+    if _is_teacher(user_role) and not _is_admin(user_role):
+        if not await teacher_subject_assignments_service.teacher_can_assign_homework_for_subject(
+            db, hw.teacher_id, payload.academic_year_id, payload.class_id, payload.section_id, payload.subject_id
+        ):
+            raise ServiceError(
+                "You can assign homework only for a subject you are assigned to (teacher_subject_assignments) for this class/section",
+                status.HTTP_403_FORBIDDEN,
+            )
     ha = HomeworkAssignment(
         homework_id=payload.homework_id,
         academic_year_id=payload.academic_year_id,
         class_id=payload.class_id,
         section_id=payload.section_id,
+        subject_id=payload.subject_id,
         due_date=payload.due_date,
         assigned_by=user_id,
     )
