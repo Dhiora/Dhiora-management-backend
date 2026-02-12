@@ -707,10 +707,32 @@ SCHOOL_SUBJECTS_TABLE: str = """
         is_active BOOLEAN NOT NULL DEFAULT TRUE,
         display_order INTEGER,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        CONSTRAINT uq_school_subject_tenant_code UNIQUE (tenant_id, code)
+        CONSTRAINT uq_school_subject_tenant_dept_code UNIQUE (tenant_id, department_id, code)
     );
 """
-# For existing DBs that had school.subjects.department_id → school.departments: point to core.departments
+# Migrate subject uniqueness from (tenant_id, code) to (tenant_id, department_id, code)
+ALTER_SUBJECTS_UNIQUE_TENANT_DEPT_CODE: str = """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'school' AND table_name = 'subjects') THEN
+            RETURN;
+        END IF;
+        ALTER TABLE school.subjects DROP CONSTRAINT IF EXISTS uq_school_subject_tenant_code;
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint c
+            JOIN pg_class t ON c.conrelid = t.oid
+            JOIN pg_namespace n ON t.relnamespace = n.oid
+            WHERE n.nspname = 'school' AND t.relname = 'subjects' AND c.conname = 'uq_school_subject_tenant_dept_code'
+        ) THEN
+            ALTER TABLE school.subjects ADD CONSTRAINT uq_school_subject_tenant_dept_code
+                UNIQUE (tenant_id, department_id, code);
+        END IF;
+    EXCEPTION
+        WHEN others THEN NULL;
+    END $$;
+"""
+# For existing DBs: ensure school.subjects.department_id references core.departments(id).
+# Drop all possible FK names (school_subjects_*, subjects_*) then add correct one to core.departments.
 ALTER_SUBJECTS_DEPARTMENT_TO_CORE: str = """
     DO $$
     BEGIN
@@ -718,6 +740,7 @@ ALTER_SUBJECTS_DEPARTMENT_TO_CORE: str = """
             RETURN;
         END IF;
         ALTER TABLE school.subjects DROP CONSTRAINT IF EXISTS school_subjects_department_id_fkey;
+        ALTER TABLE school.subjects DROP CONSTRAINT IF EXISTS subjects_department_id_fkey;
         IF NOT EXISTS (
             SELECT 1 FROM pg_constraint c
             JOIN pg_class t ON c.conrelid = t.oid
@@ -770,6 +793,20 @@ TIMETABLES_TABLE: str = """
         end_time TIME NOT NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         CONSTRAINT chk_timetable_day_of_week CHECK (day_of_week >= 0 AND day_of_week <= 6)
+    );
+"""
+
+# Class Teacher Assignment: ONE teacher per class-section per academic year (attendance finalization, leave, etc.)
+CLASS_TEACHER_ASSIGNMENTS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.class_teacher_assignments (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        academic_year_id UUID NOT NULL REFERENCES core.academic_years(id) ON DELETE CASCADE,
+        class_id UUID NOT NULL REFERENCES core.classes(id),
+        section_id UUID NOT NULL REFERENCES core.sections(id),
+        teacher_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_class_teacher_assignment UNIQUE (academic_year_id, class_id, section_id)
     );
 """
 
@@ -1062,6 +1099,222 @@ LEAVE_AUDIT_LOGS_TABLE: str = """
     );
 """
 
+# ----- Fee Management -----
+FEE_COMPONENTS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.fee_components (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        name VARCHAR(100) NOT NULL,
+        code VARCHAR(50) NOT NULL,
+        description TEXT,
+        component_category VARCHAR(50) NOT NULL,
+        allow_discount BOOLEAN NOT NULL DEFAULT TRUE,
+        is_mandatory_default BOOLEAN NOT NULL DEFAULT TRUE,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_fee_component_tenant_code UNIQUE (tenant_id, code),
+        CONSTRAINT chk_fee_component_category CHECK (component_category IN ('ACADEMIC','TRANSPORT','HOSTEL','OTHER'))
+    );
+"""
+
+ALTER_FEE_COMPONENTS_CATEGORY_CHECK: str = """
+    DO $$
+    BEGIN
+        IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='school' AND table_name='fee_components') THEN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint c
+                JOIN pg_class t ON c.conrelid = t.oid
+                JOIN pg_namespace n ON t.relnamespace = n.oid
+                WHERE n.nspname = 'school'
+                  AND t.relname = 'fee_components'
+                  AND c.conname = 'chk_fee_component_category'
+            ) THEN
+                ALTER TABLE school.fee_components
+                ADD CONSTRAINT chk_fee_component_category
+                CHECK (component_category IN ('ACADEMIC','TRANSPORT','HOSTEL','OTHER'));
+            END IF;
+        END IF;
+    EXCEPTION
+        WHEN others THEN NULL;
+    END $$;
+"""
+
+CLASS_FEE_STRUCTURES_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.class_fee_structures (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        academic_year_id UUID NOT NULL REFERENCES core.academic_years(id) ON DELETE RESTRICT,
+        class_id UUID NOT NULL REFERENCES core.classes(id) ON DELETE CASCADE,
+        fee_component_id UUID NOT NULL REFERENCES school.fee_components(id) ON DELETE RESTRICT,
+        amount NUMERIC(12, 2) NOT NULL,
+        frequency VARCHAR(30) NOT NULL,
+        due_date DATE,
+        is_mandatory BOOLEAN NOT NULL DEFAULT TRUE,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_class_fee_structure_ay_class_component UNIQUE (academic_year_id, class_id, fee_component_id)
+    );
+"""
+
+STUDENT_FEE_ASSIGNMENTS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.student_fee_assignments (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        academic_year_id UUID NOT NULL REFERENCES core.academic_years(id) ON DELETE RESTRICT,
+        student_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+        source_type VARCHAR(20) NOT NULL DEFAULT 'TEMPLATE',
+        class_fee_structure_id UUID REFERENCES school.class_fee_structures(id) ON DELETE RESTRICT,
+        custom_name VARCHAR(255),
+        base_amount NUMERIC(12, 2) NOT NULL,
+        total_discount NUMERIC(12, 2) NOT NULL DEFAULT 0,
+        final_amount NUMERIC(12, 2) NOT NULL,
+        status VARCHAR(20) NOT NULL DEFAULT 'unpaid',
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT chk_student_fee_assignment_source_type CHECK (source_type IN ('TEMPLATE','CUSTOM')),
+        CONSTRAINT chk_student_fee_assignment_source_fields CHECK (
+            (source_type = 'TEMPLATE' AND class_fee_structure_id IS NOT NULL AND custom_name IS NULL)
+            OR
+            (source_type = 'CUSTOM' AND class_fee_structure_id IS NULL AND custom_name IS NOT NULL)
+        ),
+        CONSTRAINT chk_student_fee_assignment_status CHECK (status IN ('unpaid','partial','paid'))
+    );
+"""
+
+ALTER_STUDENT_FEE_ASSIGNMENTS_UPGRADE: str = """
+    DO $$
+    BEGIN
+        IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='school' AND table_name='student_fee_assignments') THEN
+            -- Add new columns (idempotent)
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema='school' AND table_name='student_fee_assignments' AND column_name='source_type'
+            ) THEN
+                ALTER TABLE school.student_fee_assignments ADD COLUMN source_type VARCHAR(20) NOT NULL DEFAULT 'TEMPLATE';
+            END IF;
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema='school' AND table_name='student_fee_assignments' AND column_name='custom_name'
+            ) THEN
+                ALTER TABLE school.student_fee_assignments ADD COLUMN custom_name VARCHAR(255);
+            END IF;
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema='school' AND table_name='student_fee_assignments' AND column_name='base_amount'
+            ) THEN
+                ALTER TABLE school.student_fee_assignments ADD COLUMN base_amount NUMERIC(12, 2);
+                -- Backfill base_amount from legacy original_amount if present
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema='school' AND table_name='student_fee_assignments' AND column_name='original_amount'
+                ) THEN
+                    UPDATE school.student_fee_assignments SET base_amount = original_amount WHERE base_amount IS NULL;
+                END IF;
+                -- Ensure not-null if possible (skip if existing rows still null)
+                BEGIN
+                    ALTER TABLE school.student_fee_assignments ALTER COLUMN base_amount SET NOT NULL;
+                EXCEPTION WHEN others THEN NULL;
+                END;
+            END IF;
+            -- class_fee_structure_id: allow NULL for CUSTOM
+            BEGIN
+                ALTER TABLE school.student_fee_assignments ALTER COLUMN class_fee_structure_id DROP NOT NULL;
+            EXCEPTION WHEN others THEN NULL;
+            END;
+
+            -- Add constraints if missing
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint c
+                JOIN pg_class t ON c.conrelid = t.oid
+                JOIN pg_namespace n ON t.relnamespace = n.oid
+                WHERE n.nspname = 'school' AND t.relname = 'student_fee_assignments'
+                  AND c.conname = 'chk_student_fee_assignment_source_type'
+            ) THEN
+                ALTER TABLE school.student_fee_assignments
+                ADD CONSTRAINT chk_student_fee_assignment_source_type CHECK (source_type IN ('TEMPLATE','CUSTOM'));
+            END IF;
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint c
+                JOIN pg_class t ON c.conrelid = t.oid
+                JOIN pg_namespace n ON t.relnamespace = n.oid
+                WHERE n.nspname = 'school' AND t.relname = 'student_fee_assignments'
+                  AND c.conname = 'chk_student_fee_assignment_source_fields'
+            ) THEN
+                ALTER TABLE school.student_fee_assignments
+                ADD CONSTRAINT chk_student_fee_assignment_source_fields CHECK (
+                    (source_type = 'TEMPLATE' AND class_fee_structure_id IS NOT NULL AND custom_name IS NULL)
+                    OR
+                    (source_type = 'CUSTOM' AND class_fee_structure_id IS NULL AND custom_name IS NOT NULL)
+                );
+            END IF;
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint c
+                JOIN pg_class t ON c.conrelid = t.oid
+                JOIN pg_namespace n ON t.relnamespace = n.oid
+                WHERE n.nspname = 'school' AND t.relname = 'student_fee_assignments'
+                  AND c.conname = 'chk_student_fee_assignment_status'
+            ) THEN
+                ALTER TABLE school.student_fee_assignments
+                ADD CONSTRAINT chk_student_fee_assignment_status CHECK (status IN ('unpaid','partial','paid'));
+            END IF;
+        END IF;
+    EXCEPTION WHEN others THEN NULL;
+    END $$;
+"""
+
+STUDENT_FEE_DISCOUNTS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.student_fee_discounts (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        academic_year_id UUID NOT NULL REFERENCES core.academic_years(id) ON DELETE RESTRICT,
+        student_fee_assignment_id UUID NOT NULL REFERENCES school.student_fee_assignments(id) ON DELETE CASCADE,
+        discount_name VARCHAR(100) NOT NULL,
+        discount_category VARCHAR(30) NOT NULL,
+        discount_type VARCHAR(20) NOT NULL,
+        discount_value NUMERIC(12, 2) NOT NULL,
+        calculated_discount_amount NUMERIC(12, 2) NOT NULL,
+        reason TEXT,
+        approved_by UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+"""
+
+PAYMENT_TRANSACTIONS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.payment_transactions (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        academic_year_id UUID NOT NULL REFERENCES core.academic_years(id) ON DELETE RESTRICT,
+        student_fee_assignment_id UUID NOT NULL REFERENCES school.student_fee_assignments(id) ON DELETE RESTRICT,
+        amount_paid NUMERIC(12, 2) NOT NULL,
+        payment_mode VARCHAR(30) NOT NULL,
+        transaction_reference VARCHAR(100),
+        payment_status VARCHAR(20) NOT NULL,
+        paid_at TIMESTAMPTZ NOT NULL,
+        collected_by UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+"""
+
+FEE_AUDIT_LOGS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.fee_audit_logs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        reference_table VARCHAR(50) NOT NULL,
+        reference_id UUID NOT NULL,
+        action_type VARCHAR(30) NOT NULL,
+        old_value JSONB,
+        new_value JSONB,
+        changed_by UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+"""
+
 # Drop class_id, section_id from student_profiles (after backfill)
 ALTER_STUDENT_PROFILES_DROP_CLASS_SECTION: str = """
     DO $$
@@ -1166,6 +1419,7 @@ async def ensure_tables(db_engine: AsyncEngine) -> None:
         await conn.execute(text(ALTER_TEACHER_CLASS_ASSIGNMENTS_UNIQUE_WITH_SUBJECT))
         await conn.execute(text(SCHOOL_SUBJECTS_TABLE))
         await conn.execute(text(ALTER_SUBJECTS_DEPARTMENT_TO_CORE))
+        await conn.execute(text(ALTER_SUBJECTS_UNIQUE_TENANT_DEPT_CODE))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_school_subjects_tenant ON school.subjects(tenant_id)"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_school_subjects_department ON school.subjects(department_id)"))
         await conn.execute(text(CLASS_SUBJECTS_TABLE))
@@ -1174,6 +1428,10 @@ async def ensure_tables(db_engine: AsyncEngine) -> None:
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_teacher_subject_assignments_teacher ON school.teacher_subject_assignments(teacher_id)"))
         await conn.execute(text(TIMETABLES_TABLE))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_timetables_ay_class_section ON school.timetables(academic_year_id, class_id, section_id)"))
+        await conn.execute(text(CLASS_TEACHER_ASSIGNMENTS_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_class_teacher_assignments_tenant ON school.class_teacher_assignments(tenant_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_class_teacher_assignments_ay ON school.class_teacher_assignments(academic_year_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_class_teacher_assignments_teacher ON school.class_teacher_assignments(teacher_id)"))
         await conn.execute(text(STUDENT_ATTENDANCE_TABLE))
         await conn.execute(text(STUDENT_DAILY_ATTENDANCE_TABLE))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_student_daily_attendance_tenant_date ON school.student_daily_attendance(tenant_id, attendance_date)"))
@@ -1201,6 +1459,24 @@ async def ensure_tables(db_engine: AsyncEngine) -> None:
         await conn.execute(text(HOMEWORK_ATTEMPTS_TABLE))
         await conn.execute(text(HOMEWORK_SUBMISSIONS_TABLE))
         await conn.execute(text(HOMEWORK_HINT_USAGE_TABLE))
+        await conn.execute(text(FEE_COMPONENTS_TABLE))
+        await conn.execute(text(ALTER_FEE_COMPONENTS_CATEGORY_CHECK))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_fee_components_tenant_id ON school.fee_components(tenant_id)"))
+        await conn.execute(text(CLASS_FEE_STRUCTURES_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_class_fee_structures_tenant ON school.class_fee_structures(tenant_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_class_fee_structures_ay_class ON school.class_fee_structures(academic_year_id, class_id)"))
+        await conn.execute(text(STUDENT_FEE_ASSIGNMENTS_TABLE))
+        await conn.execute(text(ALTER_STUDENT_FEE_ASSIGNMENTS_UPGRADE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_student_fee_assignments_tenant ON school.student_fee_assignments(tenant_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_student_fee_assignments_student ON school.student_fee_assignments(student_id, academic_year_id)"))
+        await conn.execute(text(STUDENT_FEE_DISCOUNTS_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_student_fee_discounts_tenant ON school.student_fee_discounts(tenant_id)"))
+        await conn.execute(text(PAYMENT_TRANSACTIONS_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_payment_transactions_tenant ON school.payment_transactions(tenant_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_payment_transactions_assignment ON school.payment_transactions(student_fee_assignment_id)"))
+        await conn.execute(text(FEE_AUDIT_LOGS_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_fee_audit_logs_tenant ON school.fee_audit_logs(tenant_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_fee_audit_logs_reference ON school.fee_audit_logs(reference_table, reference_id)"))
 
     # Backfill student_academic_records from existing student_profiles (class_id, section_id)
     # Idempotent: only inserts if no record exists for (student_id, current_academic_year_id)

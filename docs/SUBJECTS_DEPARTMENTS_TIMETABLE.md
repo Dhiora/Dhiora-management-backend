@@ -126,3 +126,15 @@ One slot per (class, section, subject, teacher, day, time range).
 | PARENT   | —                                                                        | —                    | —                                   |
 
 Student/Parent: read-only access to attendance after status is SUBMITTED.
+
+---
+
+## 8. Class Teacher Assignment (separate module)
+
+**Class Teacher** = one teacher responsible for one class-section in one academic year. Used for attendance finalization, leave approvals, parent communication, class-level reports. **Not** subject or timetable logic.
+
+**Table:** school.class_teacher_assignments — UNIQUE (academic_year_id, class_id, section_id).
+
+**APIs:** `/api/v1/class-teachers` — CRUD. Only ADMIN can create/update/delete; TEACHER can read (own assignment only).
+
+**Helpers (for attendance/leave):** `get_class_teacher_by_context(academic_year_id, class_id, section_id)`, `is_user_class_teacher(user_id, academic_year_id, class_id, section_id)`.

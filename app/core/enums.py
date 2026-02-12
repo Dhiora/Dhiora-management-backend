@@ -10,3 +10,21 @@ class OrganizationType(str, Enum):
     SHOPPING_MALL = "Shopping Mall"
     OTHER = "Other"
 
+
+class FeeComponentCategory(str, Enum):
+    ACADEMIC = "ACADEMIC"
+    TRANSPORT = "TRANSPORT"
+    HOSTEL = "HOSTEL"
+    OTHER = "OTHER"
+
+
+class StudentFeeSourceType(str, Enum):
+    TEMPLATE = "TEMPLATE"
+    CUSTOM = "CUSTOM"
+
+
+class StudentFeeStatus(str, Enum):
+    unpaid = "unpaid"
+    partial = "partial"
+    paid = "paid"
+

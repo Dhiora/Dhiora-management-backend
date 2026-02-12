@@ -1,4 +1,4 @@
-"""Global dropdown service: classes, classes-with-sections, and academic years."""
+"""Global dropdown service: academic years, teachers, classes, and classes-with-sections."""
 
 from typing import List, Optional, Union
 from uuid import UUID
@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.academic_years import service as academic_years_service
 from app.api.v1.classes import service as class_service
+from app.api.v1.modules.users import service as users_service
 from app.api.v1.sections import service as section_service
 
 from .schemas import (
@@ -14,6 +15,7 @@ from .schemas import (
     ClassOnlyDropdownItem,
     ClassWithSectionsDropdownItem,
     SectionDropdownItem,
+    TeacherDropdownItem,
 )
 
 
@@ -30,12 +32,14 @@ async def get_classes_sections_dropdown(
     academic_year_id: Optional[UUID] = None,
 ) -> Union[
     List[AcademicYearDropdownItem],
+    List[TeacherDropdownItem],
     List[ClassOnlyDropdownItem],
     List[ClassWithSectionsDropdownItem],
 ]:
     """
     Get dropdown data by indicator.
     - indicator=AY: list of { academicYearId, academicYearName }.
+    - indicator=T: list of { teacherId, teacherName } (employees).
     - indicator=C: list of { className, classId } (no sections key).
     - indicator=CS: list of { className, classId, sections: [...] } (sections for given academic year).
     """
@@ -49,6 +53,16 @@ async def get_classes_sections_dropdown(
                 academicYearName=ay.name,
             )
             for ay in years
+        ]
+
+    if indicator == "T":
+        employees = await users_service.list_employees(db, tenant_id)
+        return [
+            TeacherDropdownItem(
+                teacherId=_to_uuid(emp.id),
+                teacherName=emp.full_name or "",
+            )
+            for emp in employees
         ]
 
     classes = await class_service.list_classes(db, tenant_id, active_only=True)

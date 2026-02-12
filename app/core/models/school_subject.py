@@ -13,7 +13,7 @@ from app.db.session import Base
 class SchoolSubject(Base):
     __tablename__ = "subjects"
     __table_args__ = (
-        UniqueConstraint("tenant_id", "code", name="uq_school_subject_tenant_code"),
+        UniqueConstraint("tenant_id", "department_id", "code", name="uq_school_subject_tenant_dept_code"),
         {"schema": "school"},
     )
 

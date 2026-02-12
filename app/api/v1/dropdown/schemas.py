@@ -15,6 +15,15 @@ class AcademicYearDropdownItem(BaseModel):
         populate_by_name = True
 
 
+class TeacherDropdownItem(BaseModel):
+    """Teacher/employee (indicator=T)."""
+    teacherId: UUID = Field(..., description="User UUID (employee)")
+    teacherName: str = Field(..., description="Full name")
+
+    class Config:
+        populate_by_name = True
+
+
 class SectionDropdownItem(BaseModel):
     sectionName: str = Field(..., description="Section name (e.g. A, B, C)")
     sectionId: UUID = Field(..., description="Section UUID")

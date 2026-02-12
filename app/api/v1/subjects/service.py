@@ -26,6 +26,45 @@ def _to_response(s: SchoolSubject) -> SubjectResponse:
     )
 
 
+def _conflict_message(existing: SchoolSubject, code: str) -> str:
+    return (
+        f"Subject code '{code}' already exists in school.subjects "
+        f"(existing: name='{existing.name}', id={existing.id}, department_id={existing.department_id})"
+    )
+
+
+async def _existing_in_school_subjects(
+    db: AsyncSession,
+    tenant_id: UUID,
+    department_id: UUID,
+    code: str,
+    exclude_subject_id: Optional[UUID] = None,
+) -> Optional[SchoolSubject]:
+    """Check only school.subjects (this API's table). Uniqueness is (tenant_id, department_id, code)."""
+    stmt = select(SchoolSubject).where(
+        SchoolSubject.tenant_id == tenant_id,
+        SchoolSubject.department_id == department_id,
+        SchoolSubject.code == code,
+    )
+    if exclude_subject_id is not None:
+        stmt = stmt.where(SchoolSubject.id != exclude_subject_id)
+    result = await db.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def _find_any_by_tenant_and_code(
+    db: AsyncSession, tenant_id: UUID, code: str
+) -> Optional[SchoolSubject]:
+    """Find any row in school.subjects with this tenant and code (used when DB still has old tenant+code constraint)."""
+    result = await db.execute(
+        select(SchoolSubject).where(
+            SchoolSubject.tenant_id == tenant_id,
+            SchoolSubject.code == code,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
 async def create_subject(
     db: AsyncSession,
     tenant_id: UUID,
@@ -36,6 +75,10 @@ async def create_subject(
         raise ServiceError("Invalid department", status.HTTP_400_BAD_REQUEST)
     code = payload.code.strip().upper()
     name = payload.name.strip()
+    # Check only school.subjects, same (tenant, department, code)
+    existing = await _existing_in_school_subjects(db, tenant_id, payload.department_id, code)
+    if existing:
+        raise ServiceError(_conflict_message(existing, code), status.HTTP_409_CONFLICT)
     try:
         obj = SchoolSubject(
             tenant_id=tenant_id,
@@ -49,9 +92,26 @@ async def create_subject(
         await db.commit()
         await db.refresh(obj)
         return _to_response(obj)
-    except IntegrityError:
+    except IntegrityError as e:
         await db.rollback()
-        raise ServiceError("Subject code already exists for this tenant", status.HTTP_409_CONFLICT)
+        err_msg = str(e.orig) if getattr(e, "orig", None) else str(e)
+        # FK violation: department_id not in departments table (e.g. wrong schema or stale data)
+        if "foreign key" in err_msg.lower() or "department_id" in err_msg or "departments" in err_msg.lower():
+            raise ServiceError(
+                "Department not found or invalid. If the department exists in your departments list, run schema migration: python -m app.db.schema_check",
+                status.HTTP_400_BAD_REQUEST,
+            )
+        # Unique constraint: find conflicting row for a clear message
+        conflict = await _find_any_by_tenant_and_code(db, tenant_id, code)
+        if conflict:
+            msg = _conflict_message(conflict, code)
+            if conflict.department_id != payload.department_id:
+                msg += ". Code is unique per department; run schema migration if you need the same code in multiple departments."
+            raise ServiceError(msg, status.HTTP_409_CONFLICT)
+        raise ServiceError(
+            "Subject code already exists in school.subjects (run schema migration for per-department uniqueness).",
+            status.HTTP_409_CONFLICT,
+        )
 
 
 async def list_subjects(
@@ -127,13 +187,34 @@ async def update_subject(
         obj.display_order = payload.display_order
     if payload.is_active is not None:
         obj.is_active = payload.is_active
+    new_code = obj.code
+    existing = await _existing_in_school_subjects(
+        db, tenant_id, obj.department_id, new_code, exclude_subject_id=subject_id
+    )
+    if existing:
+        raise ServiceError(_conflict_message(existing, new_code), status.HTTP_409_CONFLICT)
     try:
         await db.commit()
         await db.refresh(obj)
         return _to_response(obj)
-    except IntegrityError:
+    except IntegrityError as e:
         await db.rollback()
-        raise ServiceError("Subject code already exists for this tenant", status.HTTP_409_CONFLICT)
+        err_msg = str(e.orig) if getattr(e, "orig", None) else str(e)
+        if "foreign key" in err_msg.lower() or "department_id" in err_msg or "departments" in err_msg.lower():
+            raise ServiceError(
+                "Department not found or invalid. If the department exists in your departments list, run schema migration: python -m app.db.schema_check",
+                status.HTTP_400_BAD_REQUEST,
+            )
+        conflict = await _find_any_by_tenant_and_code(db, tenant_id, new_code)
+        if conflict and conflict.id != subject_id:
+            msg = _conflict_message(conflict, new_code)
+            if conflict.department_id != obj.department_id:
+                msg += ". Code is unique per department; run schema migration if you need the same code in multiple departments."
+            raise ServiceError(msg, status.HTTP_409_CONFLICT)
+        raise ServiceError(
+            "Subject code already exists in school.subjects (run schema migration for per-department uniqueness).",
+            status.HTTP_409_CONFLICT,
+        )
 
 
 async def get_subject_dropdown(

@@ -19,6 +19,7 @@ from app.core.models.subject import Subject
 from app.core.models.school_subject import SchoolSubject
 from app.core.models.class_subject import ClassSubject
 from app.core.models.teacher_subject_assignment import TeacherSubjectAssignment
+from app.core.models.class_teacher_assignment import ClassTeacherAssignment
 from app.core.models.timetable import Timetable
 from app.core.models.student_daily_attendance import (
     StudentDailyAttendance,
@@ -34,6 +35,12 @@ from app.core.models.audit_log import AuditLog
 from app.core.models.leave_type import LeaveType
 from app.core.models.leave_request import LeaveRequest
 from app.core.models.leave_audit_log import LeaveAuditLog
+from app.core.models.fee_component import FeeComponent
+from app.core.models.class_fee_structure import ClassFeeStructure
+from app.core.models.student_fee_assignment import StudentFeeAssignment
+from app.core.models.student_fee_discount import StudentFeeDiscount
+from app.core.models.payment_transaction import PaymentTransaction
+from app.core.models.fee_audit_log import FeeAuditLog
 
 __all__ = [
     "AcademicYear",
@@ -54,6 +61,7 @@ __all__ = [
     "SchoolSubject",
     "ClassSubject",
     "TeacherSubjectAssignment",
+    "ClassTeacherAssignment",
     "Timetable",
     "StudentDailyAttendance",
     "StudentDailyAttendanceRecord",
@@ -70,5 +78,11 @@ __all__ = [
     "LeaveType",
     "LeaveRequest",
     "LeaveAuditLog",
+    "FeeComponent",
+    "ClassFeeStructure",
+    "StudentFeeAssignment",
+    "StudentFeeDiscount",
+    "PaymentTransaction",
+    "FeeAuditLog",
 ]
 
