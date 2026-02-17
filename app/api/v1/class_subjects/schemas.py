@@ -18,9 +18,17 @@ class ClassSubjectResponse(BaseModel):
     class_id: UUID
     subject_id: UUID
     created_at: datetime
+    class_name: Optional[str] = Field(None, description="Class name (core.classes); populated in list response")
+    subject_name: Optional[str] = Field(None, description="Subject name (school.subjects); populated in list response")
 
     class Config:
         from_attributes = True
+
+
+class ClassSubjectUpdate(BaseModel):
+    """At least one of class_id or subject_id must be provided."""
+    class_id: Optional[UUID] = Field(None, description="Reassign to another class (core.classes)")
+    subject_id: Optional[UUID] = Field(None, description="Change to another subject (school.subjects)")
 
 
 class ClassSubjectBulkCreate(BaseModel):

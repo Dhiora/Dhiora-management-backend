@@ -51,6 +51,8 @@ class StudentProfileUpdate(BaseModel):
 class StudentProfileResponse(StudentProfileBase):
     id: UUID
     user_id: UUID
+    class_name: Optional[str] = Field(None, description="Class name (current academic year); from core.classes")
+    section_name: Optional[str] = Field(None, description="Section name (current academic year); from core.sections")
 
     class Config:
         from_attributes = True

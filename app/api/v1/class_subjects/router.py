@@ -10,7 +10,7 @@ from app.auth.schemas import CurrentUser
 from app.core.exceptions import ServiceError
 from app.db.session import get_db
 
-from .schemas import ClassSubjectCreate, ClassSubjectResponse, ClassSubjectBulkCreate
+from .schemas import ClassSubjectCreate, ClassSubjectResponse, ClassSubjectBulkCreate, ClassSubjectUpdate
 from . import service
 
 router = APIRouter(prefix="/api/v1/class-subjects", tags=["class-subjects"])
@@ -64,6 +64,26 @@ async def list_class_subjects(
     return await service.list_class_subjects(
         db, current_user.tenant_id, academic_year_id, class_id=class_id
     )
+
+
+@router.put(
+    "/{class_subject_id}",
+    response_model=ClassSubjectResponse,
+    dependencies=[Depends(check_permission("attendance", "update")), Depends(require_writable_academic_year)],
+)
+async def update_class_subject(
+    class_subject_id: UUID,
+    payload: ClassSubjectUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    try:
+        obj = await service.update_class_subject(db, current_user.tenant_id, class_subject_id, payload)
+        if not obj:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Class-subject assignment not found")
+        return obj
+    except ServiceError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
 
 
 @router.delete(

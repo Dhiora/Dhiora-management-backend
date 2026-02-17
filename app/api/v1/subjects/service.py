@@ -5,6 +5,7 @@ from fastapi import status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.exceptions import ServiceError
 from app.core.models import SchoolSubject
@@ -13,7 +14,9 @@ from app.api.v1.departments import service as department_service
 from .schemas import SubjectCreate, SubjectDropdownItem, SubjectResponse, SubjectUpdate
 
 
-def _to_response(s: SchoolSubject) -> SubjectResponse:
+def _to_response(s: SchoolSubject, department_name: Optional[str] = None) -> SubjectResponse:
+    if department_name is None and hasattr(s, "department") and s.department is not None:
+        department_name = getattr(s.department, "name", None)
     return SubjectResponse(
         id=s.id,
         tenant_id=s.tenant_id,
@@ -23,6 +26,7 @@ def _to_response(s: SchoolSubject) -> SubjectResponse:
         display_order=s.display_order,
         is_active=s.is_active,
         created_at=s.created_at,
+        department_name=department_name,
     )
 
 
@@ -119,7 +123,11 @@ async def list_subjects(
     tenant_id: UUID,
     active_only: bool = True,
 ) -> List[SubjectResponse]:
-    stmt = select(SchoolSubject).where(SchoolSubject.tenant_id == tenant_id)
+    stmt = (
+        select(SchoolSubject)
+        .where(SchoolSubject.tenant_id == tenant_id)
+        .options(selectinload(SchoolSubject.department))
+    )
     if active_only:
         stmt = stmt.where(SchoolSubject.is_active.is_(True))
     stmt = stmt.order_by(SchoolSubject.display_order.nullslast(), SchoolSubject.name)

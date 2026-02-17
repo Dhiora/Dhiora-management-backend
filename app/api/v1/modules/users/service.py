@@ -15,7 +15,7 @@ from sqlalchemy.orm import selectinload
 
 from app.auth.models import Role, StaffProfile, StudentProfile, User, TeacherReferral
 from app.auth.referral_code import generate_teacher_referral_code
-from app.core.models import AcademicYear, ReferralUsage, Section, StudentAcademicRecord
+from app.core.models import AcademicYear, ReferralUsage, SchoolClass, Section, StudentAcademicRecord
 from app.auth.security import hash_password
 from app.core.exceptions import ServiceError
 from app.core.models import Tenant
@@ -225,13 +225,20 @@ async def _user_to_student_response(
     user: User,
     tenant_id: UUID,
 ) -> StudentResponse:
-    """Build StudentResponse. class_id/section_id from current student_academic_record."""
+    """Build StudentResponse. class_id/section_id from current student_academic_record; class_name/section_name from core.classes and core.sections."""
     sp = user.student_profile
     class_id, section_id, roll_number = None, None, (sp.roll_number if sp else None)
+    class_name, section_name = None, None
     if sp and user.id:
         rec = await _get_current_student_record(db, user.id, tenant_id)
         if rec:
             class_id, section_id, roll_number = rec.class_id, rec.section_id, rec.roll_number or (sp.roll_number)
+            if rec.class_id:
+                school_class = await db.get(SchoolClass, rec.class_id)
+                class_name = school_class.name if school_class else None
+            if rec.section_id:
+                section = await db.get(Section, rec.section_id)
+                section_name = section.name if section else None
     return StudentResponse(
         id=_to_uuid(user.id),
         tenant_id=_to_uuid(user.tenant_id),
@@ -249,6 +256,8 @@ async def _user_to_student_response(
             roll_number=roll_number,
             class_id=_to_uuid(class_id),
             section_id=_to_uuid(section_id),
+            class_name=class_name,
+            section_name=section_name,
         ) if sp else None,
     )
 

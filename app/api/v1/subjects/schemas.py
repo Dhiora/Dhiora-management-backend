@@ -29,6 +29,7 @@ class SubjectResponse(BaseModel):
     display_order: Optional[int] = None
     is_active: bool
     created_at: datetime
+    department_name: Optional[str] = Field(None, description="Department name (core.departments); populated in list response")
 
     class Config:
         from_attributes = True
