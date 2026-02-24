@@ -30,6 +30,11 @@ REQUIRED_TABLES: List[Tuple[str, str]] = [
     ("auth", "roles"),
     ("auth", "staff_profiles"),
     ("auth", "student_profiles"),
+    ("school", "transport_vehicle_types"),
+    ("school", "transport_routes"),
+    ("school", "transport_vehicles"),
+    ("school", "transport_subscription_plans"),
+    ("school", "transport_assignments"),
 ]
 
 
@@ -1315,6 +1320,95 @@ FEE_AUDIT_LOGS_TABLE: str = """
     );
 """
 
+# ----- Transport Management -----
+TRANSPORT_VEHICLE_TYPES_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.transport_vehicle_types (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID REFERENCES core.tenants(id) ON DELETE CASCADE,
+        academic_year_id UUID REFERENCES core.academic_years(id) ON DELETE RESTRICT,
+        name VARCHAR(100) NOT NULL,
+        description TEXT,
+        is_system_default BOOLEAN NOT NULL DEFAULT FALSE,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+"""
+
+TRANSPORT_ROUTES_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.transport_routes (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        academic_year_id UUID NOT NULL REFERENCES core.academic_years(id) ON DELETE RESTRICT,
+        route_name VARCHAR(255) NOT NULL,
+        route_code VARCHAR(50) NOT NULL,
+        start_location VARCHAR(255) NOT NULL,
+        end_location VARCHAR(255) NOT NULL,
+        total_distance_km FLOAT,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_transport_route_tenant_code UNIQUE (tenant_id, route_code)
+    );
+"""
+
+TRANSPORT_VEHICLES_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.transport_vehicles (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        academic_year_id UUID REFERENCES core.academic_years(id) ON DELETE RESTRICT,
+        vehicle_number VARCHAR(50) NOT NULL,
+        vehicle_type_id UUID NOT NULL REFERENCES school.transport_vehicle_types(id) ON DELETE RESTRICT,
+        capacity INTEGER NOT NULL,
+        driver_name VARCHAR(255),
+        insurance_expiry DATE,
+        fitness_expiry DATE,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_transport_vehicle_tenant_number UNIQUE (tenant_id, vehicle_number)
+    );
+"""
+
+TRANSPORT_SUBSCRIPTION_PLANS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.transport_subscription_plans (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        academic_year_id UUID NOT NULL REFERENCES core.academic_years(id) ON DELETE RESTRICT,
+        route_id UUID NOT NULL REFERENCES school.transport_routes(id) ON DELETE CASCADE,
+        plan_name VARCHAR(255) NOT NULL,
+        description TEXT,
+        fee_amount NUMERIC(12, 2) NOT NULL,
+        billing_cycle VARCHAR(30) NOT NULL,
+        is_default BOOLEAN NOT NULL DEFAULT FALSE,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+"""
+
+TRANSPORT_ASSIGNMENTS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.transport_assignments (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        academic_year_id UUID NOT NULL REFERENCES core.academic_years(id) ON DELETE RESTRICT,
+        person_type VARCHAR(20) NOT NULL,
+        person_id UUID NOT NULL,
+        route_id UUID NOT NULL REFERENCES school.transport_routes(id) ON DELETE RESTRICT,
+        vehicle_id UUID REFERENCES school.transport_vehicles(id) ON DELETE SET NULL,
+        subscription_plan_id UUID REFERENCES school.transport_subscription_plans(id) ON DELETE SET NULL,
+        pickup_point VARCHAR(255),
+        drop_point VARCHAR(255),
+        custom_fee NUMERIC(12, 2),
+        fee_mode VARCHAR(30) NOT NULL,
+        start_date DATE NOT NULL,
+        end_date DATE,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+"""
+
 # Drop class_id, section_id from student_profiles (after backfill)
 ALTER_STUDENT_PROFILES_DROP_CLASS_SECTION: str = """
     DO $$
@@ -1477,6 +1571,26 @@ async def ensure_tables(db_engine: AsyncEngine) -> None:
         await conn.execute(text(FEE_AUDIT_LOGS_TABLE))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_fee_audit_logs_tenant ON school.fee_audit_logs(tenant_id)"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_fee_audit_logs_reference ON school.fee_audit_logs(reference_table, reference_id)"))
+        await conn.execute(text(TRANSPORT_VEHICLE_TYPES_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_transport_vehicle_types_tenant ON school.transport_vehicle_types(tenant_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_transport_vehicle_types_ay ON school.transport_vehicle_types(academic_year_id)"))
+        await conn.execute(text(TRANSPORT_ROUTES_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_transport_routes_tenant ON school.transport_routes(tenant_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_transport_routes_tenant_ay ON school.transport_routes(tenant_id, academic_year_id)"))
+        await conn.execute(text(TRANSPORT_VEHICLES_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_transport_vehicles_tenant ON school.transport_vehicles(tenant_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_transport_vehicles_type ON school.transport_vehicles(vehicle_type_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_transport_vehicles_ay ON school.transport_vehicles(academic_year_id)"))
+        await conn.execute(text(TRANSPORT_SUBSCRIPTION_PLANS_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_transport_subscription_plans_tenant ON school.transport_subscription_plans(tenant_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_transport_subscription_plans_tenant_ay ON school.transport_subscription_plans(tenant_id, academic_year_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_transport_subscription_plans_route ON school.transport_subscription_plans(route_id)"))
+        await conn.execute(text(TRANSPORT_ASSIGNMENTS_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_transport_assignments_tenant ON school.transport_assignments(tenant_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_transport_assignments_tenant_ay ON school.transport_assignments(tenant_id, academic_year_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_transport_assignments_person ON school.transport_assignments(person_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_transport_assignments_route ON school.transport_assignments(route_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_transport_assignments_vehicle ON school.transport_assignments(vehicle_id)"))
 
     # Backfill student_academic_records from existing student_profiles (class_id, section_id)
     # Idempotent: only inserts if no record exists for (student_id, current_academic_year_id)

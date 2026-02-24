@@ -28,3 +28,15 @@ class StudentFeeStatus(str, Enum):
     partial = "partial"
     paid = "paid"
 
+
+class PersonType(str, Enum):
+    STUDENT = "STUDENT"
+    TEACHER = "TEACHER"
+    STAFF = "STAFF"
+
+
+class FeeMode(str, Enum):
+    STUDENT_FEE = "STUDENT_FEE"
+    SALARY_DEDUCTION = "SALARY_DEDUCTION"
+    FREE = "FREE"
+

@@ -62,11 +62,109 @@ Base: `/api/v1/admissions`. All require authentication.
 |--------|------|-------------|-------------|
 | POST   | `/requests` | admissions.create | Raise request (track set by backend) |
 | GET    | `/requests/my` | admissions.read | My requests |
-| GET    | `/requests?status=` | admissions.read | All requests (filter by status) |
-| POST   | `/requests/{id}/approve` | admissions.update | Approve (body: section_id, remarks?) |
-| POST   | `/requests/{id}/reject` | admissions.update | Reject (body: remarks?) |
-| GET    | `/students?status=` | students.read | List admission students |
-| POST   | `/students/{id}/activate` | students.update | Activate (body: password, joined_date?) |
+| GET    | `/requests` | admissions.read | All requests (optional filter by status) |
+| POST   | `/requests/{request_id}/approve` | admissions.update | Approve (creates admission_student INACTIVE) |
+| POST   | `/requests/{request_id}/reject` | admissions.update | Reject |
+| GET    | `/students` | students.read | List admission students (optional filter by status) |
+| POST   | `/students/{student_id}/activate` | students.update | Activate (create User + profile + academic record) |
+
+### 4.1 POST `/requests` – Raise admission request
+
+**Request body:**
+
+```json
+{
+  "student_name": "string (required, 1–255)",
+  "parent_name": "string (optional, max 255)",
+  "mobile": "string (optional, max 50)",
+  "email": "email (optional)",
+  "class_applied_for": "uuid (required) – Class ID applying for",
+  "section_applied_for": "uuid (optional) – Section; can be set at approval instead",
+  "referral_code": "string (optional, max 20) – If valid, track=CAMPAIGN_REFERRAL",
+  "raised_via_website_form": false
+}
+```
+
+- `raised_via_website_form`: if `true` and no teacher/referral, track becomes `WEBSITE_FORM`.
+- **Track** is set by backend (see §2). Response includes `track`, `status` (e.g. `PENDING_APPROVAL`), `academic_year_id`, `raised_by_user_id`, `raised_by_role`, etc.
+
+**Response:** `AdmissionRequestResponse` (id, tenant_id, student_name, parent_name, mobile, email, class_applied_for, section_applied_for, academic_year_id, track, status, raised_by_user_id, raised_by_role, referral_teacher_id, approved_by_user_id, approved_by_role, approved_at, remarks, created_at, updated_at).
+
+---
+
+### 4.2 GET `/requests/my` – My requests
+
+No query params. Returns `List[AdmissionRequestResponse]` for the current user.
+
+---
+
+### 4.3 GET `/requests` – All requests
+
+**Query:**
+
+| Param   | Type   | Description |
+|---------|--------|-------------|
+| `status` | string | Optional. One of: `PENDING_APPROVAL`, `APPROVED`, `REJECTED` |
+
+Returns `List[AdmissionRequestResponse]`.
+
+---
+
+### 4.4 POST `/requests/{request_id}/approve` – Approve request
+
+**Request body:**
+
+```json
+{
+  "section_id": "uuid (required) – Section for the approved student (must belong to request’s class)",
+  "remarks": "string (optional, max 2000)"
+}
+```
+
+Creates an **admission_student** with status `INACTIVE`. Response is updated `AdmissionRequestResponse` (status=APPROVED, approved_by_*, approved_at, etc.).
+
+---
+
+### 4.5 POST `/requests/{request_id}/reject` – Reject request
+
+**Request body:**
+
+```json
+{
+  "remarks": "string (optional, max 2000)"
+}
+```
+
+Response is updated `AdmissionRequestResponse` (status=REJECTED).
+
+---
+
+### 4.6 GET `/students` – List admission students
+
+**Query:**
+
+| Param   | Type   | Description |
+|---------|--------|-------------|
+| `status` | string | Optional. One of: `INACTIVE`, `ACTIVE` |
+
+Use `status=INACTIVE` for the activation queue. Returns `List[AdmissionStudentResponse]`.
+
+**Response fields (per item):** id, tenant_id, admission_request_id, user_id (null until activated), student_name, parent_name, mobile, email, class_id, section_id, academic_year_id, track, status, joined_date (null until activated), created_at, updated_at.
+
+---
+
+### 4.7 POST `/students/{student_id}/activate` – Activate student
+
+**Request body:**
+
+```json
+{
+  "password": "string (required, min 8) – Initial password for the new user account",
+  "joined_date": "date (optional) – Physical join date; default today"
+}
+```
+
+Creates auth **User**, **StudentProfile**, and **StudentAcademicRecord**; sets admission_student `user_id`, status=ACTIVE, joined_date. Response is updated `AdmissionStudentResponse`.
 
 ---
 

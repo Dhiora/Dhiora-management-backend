@@ -41,6 +41,11 @@ from app.core.models.student_fee_assignment import StudentFeeAssignment
 from app.core.models.student_fee_discount import StudentFeeDiscount
 from app.core.models.payment_transaction import PaymentTransaction
 from app.core.models.fee_audit_log import FeeAuditLog
+from app.core.models.transport_vehicle_type import TransportVehicleType
+from app.core.models.transport_route import TransportRoute
+from app.core.models.transport_vehicle import TransportVehicle
+from app.core.models.transport_subscription_plan import TransportSubscriptionPlan
+from app.core.models.transport_assignment import TransportAssignment
 
 __all__ = [
     "AcademicYear",
@@ -84,5 +89,10 @@ __all__ = [
     "StudentFeeDiscount",
     "PaymentTransaction",
     "FeeAuditLog",
+    "TransportVehicleType",
+    "TransportRoute",
+    "TransportVehicle",
+    "TransportSubscriptionPlan",
+    "TransportAssignment",
 ]
 
