@@ -1,0 +1,743 @@
+"""AI Classroom service with transcription, embedding, and RAG."""
+
+import io
+from datetime import datetime, timezone
+from typing import List, Optional, Tuple
+from uuid import UUID
+
+import openai
+from fastapi import HTTPException, UploadFile, status
+from openai import AsyncOpenAI
+from sqlalchemy import delete, select, text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.auth.models import User
+from app.core.config import settings
+from app.core.exceptions import ServiceError
+from app.core.models import (
+    AIDoubtChat,
+    AIDoubtMessage,
+    AILectureChunk,
+    AILectureSession,
+    AcademicYear,
+    SchoolClass,
+    SchoolSubject,
+    Section,
+)
+
+from .schemas import DoubtAskRequest, LectureCreate, RecordingStartRequest
+
+client = AsyncOpenAI(api_key=settings.openai_api_key)
+
+
+def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
+    """Split text into semantic chunks with overlap."""
+    if not text or len(text) <= chunk_size:
+        return [text] if text else []
+
+    chunks = []
+    start = 0
+    text_length = len(text)
+
+    while start < text_length:
+        end = start + chunk_size
+        if end >= text_length:
+            chunks.append(text[start:].strip())
+            break
+
+        # Try to break at sentence boundary
+        chunk = text[start:end]
+        last_period = chunk.rfind(".")
+        last_newline = chunk.rfind("\n")
+
+        if last_period > chunk_size * 0.7 or last_newline > chunk_size * 0.7:
+            end = start + max(last_period + 1, last_newline + 1)
+
+        chunks.append(text[start:end].strip())
+        start = end - overlap
+
+    return [chunk for chunk in chunks if chunk]
+
+
+async def transcribe_audio(file: UploadFile) -> str:
+    """Transcribe audio file using OpenAI Whisper API."""
+    if not file.content_type or not file.content_type.startswith("audio/"):
+        raise ServiceError("Invalid file type. Expected audio file.", status.HTTP_400_BAD_REQUEST)
+
+    try:
+        contents = await file.read()
+        audio_file = io.BytesIO(contents)
+        
+        # 🔥 CRITICAL: Set filename - OpenAI uses this to infer format
+        if file.filename:
+            audio_file.name = file.filename
+        else:
+            # Infer from content_type or default to webm
+            content_type_map = {
+                "audio/webm": "audio.webm",
+                "audio/mpeg": "audio.mp3",
+                "audio/mp3": "audio.mp3",
+                "audio/wav": "audio.wav",
+                "audio/x-wav": "audio.wav",
+                "audio/mp4": "audio.m4a",
+                "audio/m4a": "audio.m4a",
+            }
+            audio_file.name = content_type_map.get(file.content_type, "audio.webm")
+
+        transcription = await client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file,
+            response_format="text",
+        )
+
+        return transcription if isinstance(transcription, str) else transcription.text
+    except openai.APIError as e:
+        raise ServiceError(f"OpenAI API error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception as e:
+        raise ServiceError(f"Transcription error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+async def generate_embedding(text: str) -> List[float]:
+    """Generate embedding using OpenAI text-embedding-3-small."""
+    try:
+        response = await client.embeddings.create(
+            model="text-embedding-3-small",
+            input=text,
+        )
+        return response.data[0].embedding
+    except openai.APIError as e:
+        raise ServiceError(f"OpenAI API error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception as e:
+        raise ServiceError(f"Embedding generation error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+async def create_lecture(
+    db: AsyncSession,
+    tenant_id: UUID,
+    teacher_id: UUID,
+    payload: LectureCreate,
+    audio_file: UploadFile,
+) -> AILectureSession:
+    """Create lecture session with transcription and embeddings."""
+    user = await db.get(User, teacher_id)
+    if not user or user.tenant_id != tenant_id:
+        raise ServiceError("Teacher not found", status.HTTP_404_NOT_FOUND)
+
+    if user.user_type != "employee" and user.role not in ("SUPER_ADMIN", "PLATFORM_ADMIN", "ADMIN"):
+        raise ServiceError("Only teachers can create lectures", status.HTTP_403_FORBIDDEN)
+
+    ay = await db.get(AcademicYear, payload.academic_year_id)
+    if not ay or ay.tenant_id != tenant_id:
+        raise ServiceError("Academic year not found", status.HTTP_404_NOT_FOUND)
+
+    cls = await db.get(SchoolClass, payload.class_id)
+    if not cls or cls.tenant_id != tenant_id:
+        raise ServiceError("Class not found", status.HTTP_404_NOT_FOUND)
+
+    if payload.section_id:
+        from app.core.models.section_model import Section
+
+        sec = await db.get(Section, payload.section_id)
+        if not sec or sec.tenant_id != tenant_id or sec.class_id != payload.class_id:
+            raise ServiceError("Section not found", status.HTTP_404_NOT_FOUND)
+
+    subj = await db.get(SchoolSubject, payload.subject_id)
+    if not subj or subj.tenant_id != tenant_id:
+        raise ServiceError("Subject not found", status.HTTP_404_NOT_FOUND)
+
+    transcript = await transcribe_audio(audio_file)
+
+    lecture = AILectureSession(
+        tenant_id=tenant_id,
+        academic_year_id=payload.academic_year_id,
+        class_id=payload.class_id,
+        section_id=payload.section_id,
+        subject_id=payload.subject_id,
+        teacher_id=teacher_id,
+        title=payload.title,
+        transcript=transcript,
+    )
+
+    db.add(lecture)
+    await db.flush()
+
+    chunks = chunk_text(transcript)
+    for chunk_content in chunks:
+        embedding = await generate_embedding(chunk_content)
+        chunk = AILectureChunk(
+            tenant_id=tenant_id,
+            lecture_id=lecture.id,
+            content=chunk_content,
+            embedding=embedding,
+        )
+        db.add(chunk)
+
+    await db.commit()
+    await db.refresh(lecture)
+
+    # Attach class, subject, and section names for response
+    lecture._class_name = cls.name
+    lecture._subject_name = subj.name
+    lecture._section_name = sec.name if payload.section_id and sec else None
+
+    return lecture
+
+
+async def ask_doubt(
+    db: AsyncSession,
+    tenant_id: UUID,
+    student_id: UUID,
+    payload: DoubtAskRequest,
+) -> Tuple[AIDoubtChat, AIDoubtMessage]:
+    """Answer student doubt using RAG."""
+    user = await db.get(User, student_id)
+    if not user or user.tenant_id != tenant_id:
+        raise ServiceError("Student not found", status.HTTP_404_NOT_FOUND)
+
+    if user.user_type != "student" and user.role not in ("SUPER_ADMIN", "PLATFORM_ADMIN", "ADMIN"):
+        raise ServiceError("Only students can ask doubts", status.HTTP_403_FORBIDDEN)
+
+    lecture = await db.get(AILectureSession, payload.lecture_id)
+    if not lecture or lecture.tenant_id != tenant_id:
+        raise ServiceError("Lecture not found", status.HTTP_404_NOT_FOUND)
+
+    question_embedding = await generate_embedding(payload.question)
+
+    embedding_str = "[" + ",".join(map(str, question_embedding)) + "]"
+
+    stmt = text("""
+        SELECT content
+        FROM school.ai_lecture_chunks
+        WHERE tenant_id = :tenant_id
+        AND lecture_id = :lecture_id
+        ORDER BY embedding <-> :question_embedding::vector
+        LIMIT 5
+    """)
+
+    result = await db.execute(
+        stmt,
+        {
+            "tenant_id": str(tenant_id),
+            "lecture_id": str(payload.lecture_id),
+            "question_embedding": embedding_str,
+        },
+    )
+
+    relevant_chunks = [row[0] for row in result.fetchall()]
+    context = "\n\n".join(relevant_chunks)
+
+    system_prompt = """You are an assistant teacher. Answer only from the provided context. 
+If the answer is not found in the context, politely say that this topic was not discussed in the lecture."""
+
+    try:
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Context from lecture:\n\n{context}\n\n\nStudent question: {payload.question}"},
+            ],
+            temperature=0.7,
+        )
+
+        ai_answer = response.choices[0].message.content
+    except openai.APIError as e:
+        raise ServiceError(f"OpenAI API error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception as e:
+        raise ServiceError(f"Error generating answer: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    chat = await db.execute(
+        select(AIDoubtChat).where(
+            AIDoubtChat.tenant_id == tenant_id,
+            AIDoubtChat.student_id == student_id,
+            AIDoubtChat.lecture_id == payload.lecture_id,
+        )
+    )
+    chat_obj = chat.scalar_one_or_none()
+
+    if not chat_obj:
+        chat_obj = AIDoubtChat(
+            tenant_id=tenant_id,
+            student_id=student_id,
+            lecture_id=payload.lecture_id,
+        )
+        db.add(chat_obj)
+        await db.flush()
+
+    student_message = AIDoubtMessage(
+        chat_id=chat_obj.id,
+        role="STUDENT",
+        message=payload.question,
+    )
+    db.add(student_message)
+
+    ai_message = AIDoubtMessage(
+        chat_id=chat_obj.id,
+        role="AI",
+        message=ai_answer,
+    )
+    db.add(ai_message)
+
+    await db.commit()
+    await db.refresh(chat_obj)
+    await db.refresh(ai_message)
+
+    return chat_obj, ai_message
+
+
+async def get_lecture(
+    db: AsyncSession,
+    tenant_id: UUID,
+    lecture_id: UUID,
+) -> Optional[AILectureSession]:
+    """Get lecture by ID with tenant check."""
+    stmt = (
+        select(
+            AILectureSession,
+            SchoolClass.name.label("class_name"),
+            SchoolSubject.name.label("subject_name"),
+            Section.name.label("section_name"),
+        )
+        .join(SchoolClass, AILectureSession.class_id == SchoolClass.id, isouter=True)
+        .join(SchoolSubject, AILectureSession.subject_id == SchoolSubject.id, isouter=True)
+        .join(Section, AILectureSession.section_id == Section.id, isouter=True)
+        .where(AILectureSession.id == lecture_id, AILectureSession.tenant_id == tenant_id)
+    )
+    
+    result = await db.execute(stmt)
+    row = result.first()
+    
+    if not row:
+        return None
+    
+    lecture = row[0]
+    lecture._class_name = row.class_name
+    lecture._subject_name = row.subject_name
+    lecture._section_name = row.section_name
+    return lecture
+
+
+async def list_lectures(
+    db: AsyncSession,
+    tenant_id: UUID,
+    teacher_id: Optional[UUID] = None,
+    class_id: Optional[UUID] = None,
+    subject_id: Optional[UUID] = None,
+) -> List[AILectureSession]:
+    """List lectures with optional filters."""
+    stmt = (
+        select(
+            AILectureSession,
+            SchoolClass.name.label("class_name"),
+            SchoolSubject.name.label("subject_name"),
+            Section.name.label("section_name"),
+        )
+        .join(SchoolClass, AILectureSession.class_id == SchoolClass.id, isouter=True)
+        .join(SchoolSubject, AILectureSession.subject_id == SchoolSubject.id, isouter=True)
+        .join(Section, AILectureSession.section_id == Section.id, isouter=True)
+        .where(AILectureSession.tenant_id == tenant_id)
+    )
+
+    if teacher_id:
+        stmt = stmt.where(AILectureSession.teacher_id == teacher_id)
+    if class_id:
+        stmt = stmt.where(AILectureSession.class_id == class_id)
+    if subject_id:
+        stmt = stmt.where(AILectureSession.subject_id == subject_id)
+
+    stmt = stmt.order_by(AILectureSession.created_at.desc())
+
+    result = await db.execute(stmt)
+    rows = result.all()
+    
+    # Attach class_name, subject_name, and section_name to lecture objects
+    lectures = []
+    for row in rows:
+        lecture = row[0]
+        lecture._class_name = row.class_name
+        lecture._subject_name = row.subject_name
+        lecture._section_name = row.section_name
+        lectures.append(lecture)
+    
+    return lectures
+
+
+async def get_doubt_chat(
+    db: AsyncSession,
+    tenant_id: UUID,
+    chat_id: UUID,
+    student_id: Optional[UUID] = None,
+) -> Optional[AIDoubtChat]:
+    """Get doubt chat by ID with tenant check."""
+    chat = await db.get(AIDoubtChat, chat_id)
+    if not chat or chat.tenant_id != tenant_id:
+        return None
+
+    if student_id and chat.student_id != student_id:
+        return None
+
+    return chat
+
+
+async def list_doubt_chats(
+    db: AsyncSession,
+    tenant_id: UUID,
+    student_id: Optional[UUID] = None,
+    lecture_id: Optional[UUID] = None,
+) -> List[AIDoubtChat]:
+    """List doubt chats with optional filters."""
+    stmt = select(AIDoubtChat).where(AIDoubtChat.tenant_id == tenant_id)
+
+    if student_id:
+        stmt = stmt.where(AIDoubtChat.student_id == student_id)
+    if lecture_id:
+        stmt = stmt.where(AIDoubtChat.lecture_id == lecture_id)
+
+    stmt = stmt.order_by(AIDoubtChat.created_at.desc())
+
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def start_recording(
+    db: AsyncSession,
+    tenant_id: UUID,
+    teacher_id: UUID,
+    payload: RecordingStartRequest,
+) -> AILectureSession:
+    """Start a new recording session."""
+    user = await db.get(User, teacher_id)
+    if not user or user.tenant_id != tenant_id:
+        raise ServiceError("Teacher not found", status.HTTP_404_NOT_FOUND)
+
+    if user.user_type != "employee" and user.role not in ("SUPER_ADMIN", "PLATFORM_ADMIN", "ADMIN"):
+        raise ServiceError("Only teachers can start recordings", status.HTTP_403_FORBIDDEN)
+
+    ay = await db.get(AcademicYear, payload.academic_year_id)
+    if not ay or ay.tenant_id != tenant_id:
+        raise ServiceError("Academic year not found", status.HTTP_404_NOT_FOUND)
+
+    cls = await db.get(SchoolClass, payload.class_id)
+    if not cls or cls.tenant_id != tenant_id:
+        raise ServiceError("Class not found", status.HTTP_404_NOT_FOUND)
+
+    if payload.section_id:
+        from app.core.models.section_model import Section
+
+        sec = await db.get(Section, payload.section_id)
+        if not sec or sec.tenant_id != tenant_id or sec.class_id != payload.class_id:
+            raise ServiceError("Section not found", status.HTTP_404_NOT_FOUND)
+
+    subj = await db.get(SchoolSubject, payload.subject_id)
+    if not subj or subj.tenant_id != tenant_id:
+        raise ServiceError("Subject not found", status.HTTP_404_NOT_FOUND)
+
+    now = datetime.now(timezone.utc)
+
+    session = AILectureSession(
+        tenant_id=tenant_id,
+        academic_year_id=payload.academic_year_id,
+        class_id=payload.class_id,
+        section_id=payload.section_id,
+        subject_id=payload.subject_id,
+        teacher_id=teacher_id,
+        title=payload.title,
+        transcript="",
+        status="RECORDING",
+        recording_started_at=now,
+        is_active_recording=True,
+        audio_buffer_size_bytes=0,
+    )
+
+    db.add(session)
+    await db.commit()
+    await db.refresh(session)
+
+    import logging
+    from app.api.v1.ai_classroom.audio_buffer_manager import buffer_manager
+
+    logger = logging.getLogger(__name__)
+    await buffer_manager.initialize(session.id)
+    logger.info(f"Recording started for session {session.id}, teacher {teacher_id}")
+
+    return session
+
+
+async def pause_recording(
+    db: AsyncSession,
+    tenant_id: UUID,
+    teacher_id: UUID,
+    session_id: UUID,
+) -> AILectureSession:
+    """Pause an active recording session."""
+    import logging
+    from app.api.v1.ai_classroom.audio_buffer_manager import buffer_manager
+
+    logger = logging.getLogger(__name__)
+
+    session = await db.get(AILectureSession, session_id)
+    if not session or session.tenant_id != tenant_id:
+        raise ServiceError("Session not found", status.HTTP_404_NOT_FOUND)
+
+    if session.teacher_id != teacher_id:
+        raise ServiceError("You do not own this session", status.HTTP_403_FORBIDDEN)
+
+    if session.status != "RECORDING":
+        raise ServiceError(f"Cannot pause session with status: {session.status}", status.HTTP_400_BAD_REQUEST)
+
+    now = datetime.now(timezone.utc)
+    
+    if session.recording_started_at:
+        elapsed = (now - session.recording_started_at).total_seconds()
+        session.total_recording_seconds = int(session.total_recording_seconds + elapsed)
+    
+    buffer_size = await buffer_manager.get_size(session_id)
+    session.audio_buffer_size_bytes = buffer_size
+    
+    session.status = "PAUSED"
+    session.recording_paused_at = now
+    session.is_active_recording = False
+
+    await db.commit()
+    await db.refresh(session)
+
+    logger.info(f"Recording paused for session {session_id}, buffer size: {buffer_size} bytes")
+
+    return session
+
+
+async def resume_recording(
+    db: AsyncSession,
+    tenant_id: UUID,
+    teacher_id: UUID,
+    session_id: UUID,
+) -> AILectureSession:
+    """Resume a paused recording session."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    session = await db.get(AILectureSession, session_id)
+    if not session or session.tenant_id != tenant_id:
+        raise ServiceError("Session not found", status.HTTP_404_NOT_FOUND)
+
+    if session.teacher_id != teacher_id:
+        raise ServiceError("You do not own this session", status.HTTP_403_FORBIDDEN)
+
+    if session.status != "PAUSED":
+        raise ServiceError(f"Cannot resume session with status: {session.status}", status.HTTP_400_BAD_REQUEST)
+
+    now = datetime.now(timezone.utc)
+    session.status = "RECORDING"
+    session.recording_started_at = now
+    session.recording_paused_at = None
+    session.is_active_recording = True
+
+    await db.commit()
+    await db.refresh(session)
+
+    logger.info(f"Recording resumed for session {session_id}")
+
+    return session
+
+
+async def stop_recording(
+    db: AsyncSession,
+    tenant_id: UUID,
+    teacher_id: UUID,
+    session_id: UUID,
+) -> AILectureSession:
+    """Stop recording and process transcript."""
+    import logging
+    from app.api.v1.ai_classroom.audio_buffer_manager import buffer_manager
+
+    logger = logging.getLogger(__name__)
+
+    session = await db.get(AILectureSession, session_id)
+    if not session or session.tenant_id != tenant_id:
+        raise ServiceError("Session not found", status.HTTP_404_NOT_FOUND)
+
+    if session.teacher_id != teacher_id:
+        raise ServiceError("You do not own this session", status.HTTP_403_FORBIDDEN)
+
+    if session.status not in ("RECORDING", "PAUSED"):
+        raise ServiceError(f"Cannot stop session with status: {session.status}", status.HTTP_400_BAD_REQUEST)
+
+    now = datetime.now(timezone.utc)
+    session.status = "PROCESSING"
+    session.is_active_recording = False
+
+    if session.recording_started_at:
+        if session.recording_paused_at:
+            elapsed = (session.recording_paused_at - session.recording_started_at).total_seconds()
+            session.total_recording_seconds = int(session.total_recording_seconds + elapsed)
+        else:
+            elapsed = (now - session.recording_started_at).total_seconds()
+            session.total_recording_seconds = int(session.total_recording_seconds + elapsed)
+
+    await db.commit()
+    await db.refresh(session)
+
+    logger.info(f"Starting transcription for session {session_id}")
+
+    audio_bytes = await buffer_manager.get_buffer(session_id)
+
+    if len(audio_bytes) == 0:
+        logger.warning(f"No audio buffer found for session {session_id}")
+        session.status = "COMPLETED"
+        await db.commit()
+        await db.refresh(session)
+        await buffer_manager.clear(session_id)
+        
+        # Load class, subject, and section names for response
+        class_obj = await db.get(SchoolClass, session.class_id)
+        subject_obj = await db.get(SchoolSubject, session.subject_id)
+        section_obj = await db.get(Section, session.section_id) if session.section_id else None
+        session._class_name = class_obj.name if class_obj else None
+        session._subject_name = subject_obj.name if subject_obj else None
+        session._section_name = section_obj.name if section_obj else None
+        
+        return session
+
+    logger.info(f"Transcribing {len(audio_bytes)} bytes for session {session_id}")
+
+    try:
+        audio_file = io.BytesIO(audio_bytes)
+        audio_file.name = "lecture.webm"
+
+        transcription = await client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file,
+            response_format="text",
+        )
+
+        transcript = transcription if isinstance(transcription, str) else transcription.text
+        logger.info(f"Transcription completed for session {session_id}, length: {len(transcript)} chars")
+
+        session.transcript = transcript
+
+    except openai.APIError as e:
+        error_msg = str(e)
+        logger.error(f"OpenAI API error during transcription for session {session_id}: {error_msg}")
+        await buffer_manager.clear(session_id)
+        raise ServiceError(f"Transcription failed: {error_msg}", status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception as e:
+        logger.error(f"Transcription error for session {session_id}: {str(e)}")
+        await buffer_manager.clear(session_id)
+        raise ServiceError(f"Transcription error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    await buffer_manager.clear(session_id)
+    logger.info(f"Buffer cleared for session {session_id}")
+
+    if transcript:
+        logger.info(f"Chunking transcript for session {session_id}")
+        chunks = chunk_text(transcript)
+        logger.info(f"Generated {len(chunks)} chunks for session {session_id}")
+
+        for chunk_content in chunks:
+            embedding = await generate_embedding(chunk_content)
+            chunk = AILectureChunk(
+                tenant_id=tenant_id,
+                lecture_id=session.id,
+                content=chunk_content,
+                embedding=embedding,
+            )
+            db.add(chunk)
+
+    session.status = "COMPLETED"
+    await db.commit()
+    await db.refresh(session)
+
+    # Load class, subject, and section names for response
+    class_obj = await db.get(SchoolClass, session.class_id)
+    subject_obj = await db.get(SchoolSubject, session.subject_id)
+    section_obj = await db.get(Section, session.section_id) if session.section_id else None
+    session._class_name = class_obj.name if class_obj else None
+    session._subject_name = subject_obj.name if subject_obj else None
+    session._section_name = section_obj.name if section_obj else None
+
+    logger.info(f"Recording stopped and processed for session {session_id}")
+
+    return session
+
+
+
+
+async def get_recording_session(
+    db: AsyncSession,
+    tenant_id: UUID,
+    session_id: UUID,
+    teacher_id: Optional[UUID] = None,
+) -> Optional[AILectureSession]:
+    """Get recording session with tenant and ownership validation."""
+    session = await db.get(AILectureSession, session_id)
+    if not session or session.tenant_id != tenant_id:
+        return None
+
+    if teacher_id and session.teacher_id != teacher_id:
+        return None
+
+    return session
+
+
+async def update_transcript(
+    db: AsyncSession,
+    tenant_id: UUID,
+    teacher_id: UUID,
+    lecture_id: UUID,
+    new_transcript: str,
+) -> AILectureSession:
+    """Update transcript and regenerate embeddings."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    lecture = await db.get(AILectureSession, lecture_id)
+    if not lecture or lecture.tenant_id != tenant_id:
+        raise ServiceError("Lecture not found", status.HTTP_404_NOT_FOUND)
+
+    if lecture.teacher_id != teacher_id:
+        raise ServiceError("You do not own this lecture", status.HTTP_403_FORBIDDEN)
+
+    if lecture.status != "COMPLETED":
+        raise ServiceError(
+            f"Cannot edit transcript. Lecture status must be COMPLETED. Current status: {lecture.status}",
+            status.HTTP_400_BAD_REQUEST,
+        )
+
+    logger.info(f"Updating transcript for lecture {lecture_id}")
+
+    # Delete old chunks
+    delete_stmt = delete(AILectureChunk).where(
+        AILectureChunk.tenant_id == tenant_id,
+        AILectureChunk.lecture_id == lecture_id,
+    )
+    await db.execute(delete_stmt)
+    logger.info(f"Deleted old chunks for lecture {lecture_id}")
+
+    # Update transcript
+    lecture.transcript = new_transcript
+    await db.flush()
+
+    # Regenerate chunks and embeddings
+    if new_transcript:
+        logger.info(f"Regenerating chunks and embeddings for lecture {lecture_id}")
+        chunks = chunk_text(new_transcript)
+        logger.info(f"Generated {len(chunks)} chunks for lecture {lecture_id}")
+
+        for chunk_content in chunks:
+            embedding = await generate_embedding(chunk_content)
+            chunk = AILectureChunk(
+                tenant_id=tenant_id,
+                lecture_id=lecture.id,
+                content=chunk_content,
+                embedding=embedding,
+            )
+            db.add(chunk)
+
+    await db.commit()
+    await db.refresh(lecture)
+
+    logger.info(f"Transcript updated and embeddings regenerated for lecture {lecture_id}")
+
+    return lecture
+

@@ -24,6 +24,7 @@ pip install -r requirements.txt
 - `JWT_ALGORITHM` – typically `HS256`
 - `ACCESS_TOKEN_EXPIRE_MINUTES` – e.g. `15`
 - `REFRESH_TOKEN_EXPIRE_DAYS` – e.g. `7`
+- `OPENAI_API_KEY` – OpenAI API key (required for AI Classroom module)
 
 4. Run the app:
 

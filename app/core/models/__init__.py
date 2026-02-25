@@ -46,6 +46,10 @@ from app.core.models.transport_route import TransportRoute
 from app.core.models.transport_vehicle import TransportVehicle
 from app.core.models.transport_subscription_plan import TransportSubscriptionPlan
 from app.core.models.transport_assignment import TransportAssignment
+from app.core.models.ai_lecture_session import AILectureSession
+from app.core.models.ai_lecture_chunk import AILectureChunk
+from app.core.models.ai_doubt_chat import AIDoubtChat
+from app.core.models.ai_doubt_message import AIDoubtMessage
 
 __all__ = [
     "AcademicYear",
@@ -94,5 +98,9 @@ __all__ = [
     "TransportVehicle",
     "TransportSubscriptionPlan",
     "TransportAssignment",
+    "AILectureSession",
+    "AILectureChunk",
+    "AIDoubtChat",
+    "AIDoubtMessage",
 ]
 
