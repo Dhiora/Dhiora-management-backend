@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.academic_years import service as academic_years_service
 from app.api.v1.classes import service as class_service
+from app.api.v1.class_subjects import service as class_subjects_service
 from app.api.v1.modules.users import service as users_service
 from app.api.v1.sections import service as section_service
 
@@ -14,7 +15,9 @@ from .schemas import (
     AcademicYearDropdownItem,
     ClassOnlyDropdownItem,
     ClassWithSectionsDropdownItem,
+    ClassWithSectionsAndSubjectsDropdownItem,
     SectionDropdownItem,
+    SubjectDropdownItem,
     TeacherDropdownItem,
 )
 
@@ -35,6 +38,7 @@ async def get_classes_sections_dropdown(
     List[TeacherDropdownItem],
     List[ClassOnlyDropdownItem],
     List[ClassWithSectionsDropdownItem],
+    List[ClassWithSectionsAndSubjectsDropdownItem],
 ]:
     """
     Get dropdown data by indicator.
@@ -42,6 +46,7 @@ async def get_classes_sections_dropdown(
     - indicator=T: list of { teacherId, teacherName } (employees).
     - indicator=C: list of { className, classId } (no sections key).
     - indicator=CS: list of { className, classId, sections: [...] } (sections for given academic year).
+    - indicator=CSS: list of { className, classId, sections: [...], subjects: [...] } for given academic year.
     """
     indicator = (indicator or "").strip().upper()
 
@@ -85,6 +90,36 @@ async def get_classes_sections_dropdown(
                 )
             )
         return result
+
+    if indicator == "CSS":
+        result_css: List[ClassWithSectionsAndSubjectsDropdownItem] = []
+        for c in classes:
+            class_id = _to_uuid(c.id)
+            sections_list = await section_service.list_sections(
+                db, tenant_id, academic_year_id=academic_year_id, active_only=True, class_id=class_id
+            )
+            sections = [
+                SectionDropdownItem(sectionName=s.name, sectionId=_to_uuid(s.id))
+                for s in sections_list
+            ]
+            # Subjects for this class in this academic year
+            subjects_list = await class_subjects_service.list_class_subjects(
+                db, tenant_id, academic_year_id=academic_year_id, class_id=class_id
+            )
+            subjects = [
+                SubjectDropdownItem(subjectName=cs.subject_name or "", subjectId=_to_uuid(cs.subject_id))
+                for cs in subjects_list
+            ]
+            result_css.append(
+                ClassWithSectionsAndSubjectsDropdownItem(
+                    className=c.name,
+                    classId=class_id,
+                    sections=sections,
+                    subjects=subjects,
+                )
+            )
+        return result_css
+
     # C or any other: classes only (no sections key in response)
     return [
         ClassOnlyDropdownItem(className=c.name, classId=_to_uuid(c.id))

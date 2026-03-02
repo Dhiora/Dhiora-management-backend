@@ -1,0 +1,2 @@
+"""AI Classroom module."""
+

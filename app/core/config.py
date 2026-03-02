@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     platform_admin_email: Optional[str] = Field(None, alias="PLATFORM_ADMIN_EMAIL")
     platform_admin_password: Optional[str] = Field(None, alias="PLATFORM_ADMIN_PASSWORD")
 
+    openai_api_key: str = Field(..., alias="OPENAI_API_KEY")
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
