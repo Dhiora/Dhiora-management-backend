@@ -49,3 +49,23 @@ class ClassWithSectionsDropdownItem(BaseModel):
 
     class Config:
         populate_by_name = True
+
+
+class SubjectDropdownItem(BaseModel):
+    """Subject (for CSS indicator)."""
+    subjectName: str = Field(..., description="Subject name")
+    subjectId: UUID = Field(..., description="Subject UUID")
+
+    class Config:
+        populate_by_name = True
+
+
+class ClassWithSectionsAndSubjectsDropdownItem(BaseModel):
+    """Class with sections and subjects (indicator=CSS)."""
+    className: str = Field(..., description="Class name (e.g. 1st, 2nd)")
+    classId: UUID = Field(..., description="Class UUID")
+    sections: List[SectionDropdownItem] = Field(..., description="Sections under this class")
+    subjects: List[SubjectDropdownItem] = Field(..., description="Subjects assigned to this class for the academic year")
+
+    class Config:
+        populate_by_name = True

@@ -13,6 +13,7 @@ from .schemas import (
     AcademicYearDropdownItem,
     ClassOnlyDropdownItem,
     ClassWithSectionsDropdownItem,
+    ClassWithSectionsAndSubjectsDropdownItem,
     TeacherDropdownItem,
 )
 from . import service
@@ -23,7 +24,11 @@ router = APIRouter(prefix="/api/v1/dropdown", tags=["dropdown"])
 async def get_dropdown_indicator_and_check_permission(
     indicator: str = Query(
         ...,
-        description="AY = academic years; T = teachers (employees); C = classes only; CS = classes with sections nested",
+        description=(
+            "AY = academic years; T = teachers (employees); "
+            "C = classes only; CS = classes with sections nested; "
+            "CSS = classes with sections and subjects nested"
+        ),
         min_length=1,
         max_length=5,
     ),
@@ -56,6 +61,7 @@ async def get_dropdown_indicator_and_check_permission(
             TeacherDropdownItem,
             ClassOnlyDropdownItem,
             ClassWithSectionsDropdownItem,
+            ClassWithSectionsAndSubjectsDropdownItem,
         ]
     ],
 )
@@ -70,6 +76,7 @@ async def get_classes_sections_dropdown(
     - **indicator=T**: Returns [{ teacherId, teacherName }, ...] (employees).
     - **indicator=C**: Returns [{ className, classId }, ...] (no sections key).
     - **indicator=CS**: Returns [{ className, classId, sections: [{ sectionName, sectionId }, ...] }, ...].
+    - **indicator=CSS**: Returns [{ className, classId, sections: [...], subjects: [{ subjectName, subjectId }, ...] }, ...].
     """
     return await service.get_classes_sections_dropdown(
         db, current_user.tenant_id, indicator, academic_year_id=current_user.academic_year_id
