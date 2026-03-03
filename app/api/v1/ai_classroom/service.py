@@ -1,6 +1,7 @@
 """AI Classroom service with transcription, embedding, and RAG."""
 
 import io
+import logging
 from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 from uuid import UUID
@@ -87,7 +88,7 @@ async def transcribe_audio(file: UploadFile) -> str:
         transcription = await client.audio.transcriptions.create(
             model="whisper-1",
             file=audio_file,
-            response_format="text",
+            response_format="verbose_json"
         )
 
         return transcription if isinstance(transcription, str) else transcription.text
@@ -210,7 +211,7 @@ async def ask_doubt(
         FROM school.ai_lecture_chunks
         WHERE tenant_id = :tenant_id
         AND lecture_id = :lecture_id
-        ORDER BY embedding <-> :question_embedding::vector
+        ORDER BY embedding <-> (:question_embedding)::vector
         LIMIT 5
     """)
 
@@ -546,9 +547,8 @@ async def stop_recording(
     teacher_id: UUID,
     session_id: UUID,
 ) -> AILectureSession:
-    """Stop recording and process transcript."""
+    """Stop recording and transition to UPLOADING. No Whisper here; upload happens via WebSocket."""
     import logging
-    from app.api.v1.ai_classroom.audio_buffer_manager import buffer_manager
 
     logger = logging.getLogger(__name__)
 
@@ -563,9 +563,6 @@ async def stop_recording(
         raise ServiceError(f"Cannot stop session with status: {session.status}", status.HTTP_400_BAD_REQUEST)
 
     now = datetime.now(timezone.utc)
-    session.status = "PROCESSING"
-    session.is_active_recording = False
-
     if session.recording_started_at:
         if session.recording_paused_at:
             elapsed = (session.recording_paused_at - session.recording_started_at).total_seconds()
@@ -574,89 +571,14 @@ async def stop_recording(
             elapsed = (now - session.recording_started_at).total_seconds()
             session.total_recording_seconds = int(session.total_recording_seconds + elapsed)
 
+    session.status = "UPLOADING"
+    session.is_active_recording = False
+    session.upload_progress_percent = 0
+
     await db.commit()
     await db.refresh(session)
 
-    logger.info(f"Starting transcription for session {session_id}")
-
-    audio_bytes = await buffer_manager.get_buffer(session_id)
-
-    if len(audio_bytes) == 0:
-        logger.warning(f"No audio buffer found for session {session_id}")
-        session.status = "COMPLETED"
-        await db.commit()
-        await db.refresh(session)
-        await buffer_manager.clear(session_id)
-        
-        # Load class, subject, and section names for response
-        class_obj = await db.get(SchoolClass, session.class_id)
-        subject_obj = await db.get(SchoolSubject, session.subject_id)
-        section_obj = await db.get(Section, session.section_id) if session.section_id else None
-        session._class_name = class_obj.name if class_obj else None
-        session._subject_name = subject_obj.name if subject_obj else None
-        session._section_name = section_obj.name if section_obj else None
-        
-        return session
-
-    logger.info(f"Transcribing {len(audio_bytes)} bytes for session {session_id}")
-
-    try:
-        audio_file = io.BytesIO(audio_bytes)
-        audio_file.name = "lecture.webm"
-
-        transcription = await client.audio.transcriptions.create(
-            model="whisper-1",
-            file=audio_file,
-            response_format="text",
-        )
-
-        transcript = transcription if isinstance(transcription, str) else transcription.text
-        logger.info(f"Transcription completed for session {session_id}, length: {len(transcript)} chars")
-
-        session.transcript = transcript
-
-    except openai.APIError as e:
-        error_msg = str(e)
-        logger.error(f"OpenAI API error during transcription for session {session_id}: {error_msg}")
-        await buffer_manager.clear(session_id)
-        raise ServiceError(f"Transcription failed: {error_msg}", status.HTTP_500_INTERNAL_SERVER_ERROR)
-    except Exception as e:
-        logger.error(f"Transcription error for session {session_id}: {str(e)}")
-        await buffer_manager.clear(session_id)
-        raise ServiceError(f"Transcription error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-    await buffer_manager.clear(session_id)
-    logger.info(f"Buffer cleared for session {session_id}")
-
-    if transcript:
-        logger.info(f"Chunking transcript for session {session_id}")
-        chunks = chunk_text(transcript)
-        logger.info(f"Generated {len(chunks)} chunks for session {session_id}")
-
-        for chunk_content in chunks:
-            embedding = await generate_embedding(chunk_content)
-            chunk = AILectureChunk(
-                tenant_id=tenant_id,
-                lecture_id=session.id,
-                content=chunk_content,
-                embedding=embedding,
-            )
-            db.add(chunk)
-
-    session.status = "COMPLETED"
-    await db.commit()
-    await db.refresh(session)
-
-    # Load class, subject, and section names for response
-    class_obj = await db.get(SchoolClass, session.class_id)
-    subject_obj = await db.get(SchoolSubject, session.subject_id)
-    section_obj = await db.get(Section, session.section_id) if session.section_id else None
-    session._class_name = class_obj.name if class_obj else None
-    session._subject_name = subject_obj.name if subject_obj else None
-    session._section_name = section_obj.name if section_obj else None
-
-    logger.info(f"Recording stopped and processed for session {session_id}")
-
+    logger.info(f"Recording stopped for session {session_id}, status=UPLOADING")
     return session
 
 
@@ -677,6 +599,112 @@ async def get_recording_session(
         return None
 
     return session
+
+
+async def process_lecture_background(session_id: UUID) -> None:
+    """
+    Background task: load session, transcribe audio, chunk, embed, then set COMPLETED
+    and notify WebSocket. On error set FAILED and notify. Do not block; uses own DB session.
+    """
+    import os
+
+    from app.core.websocket import connection_manager
+    from app.db.session import AsyncSessionLocal
+
+    logger = logging.getLogger(__name__)
+    logger.info("Background processing started for session %s", session_id)
+    audio_path: Optional[str] = None
+
+    async with AsyncSessionLocal() as db:
+        try:
+            session = await db.get(AILectureSession, session_id)
+            if not session or session.status != "PROCESSING":
+                logger.warning("Session %s not found or not PROCESSING, skip background", session_id)
+                return
+
+            tenant_id = session.tenant_id
+            audio_path = session.audio_file_path
+            if not audio_path or not os.path.isfile(audio_path):
+                session.status = "FAILED"
+                session.processing_stage = "ERROR"
+                await db.commit()
+                await connection_manager.send_to_channel(
+                    connection_manager.channel_for_session(str(session_id)),
+                    {"status": "failed", "error": "Audio file not found"},
+                )
+                return
+
+            with open(audio_path, "rb") as f:
+                audio_file = io.BytesIO(f.read())
+            audio_file.name = "lecture.webm"
+
+            transcription = await client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+                response_format="verbose_json"
+            )
+            transcript = transcription if isinstance(transcription, str) else transcription.text
+            session.transcript = transcript
+            session.processing_stage = "CHUNKING"
+            await db.commit()
+
+            chunks = chunk_text(transcript)
+            session.processing_stage = "EMBEDDING"
+            await db.commit()
+
+            for chunk_content in chunks:
+                embedding = await generate_embedding(chunk_content)
+                chunk = AILectureChunk(
+                    tenant_id=tenant_id,
+                    lecture_id=session.id,
+                    content=chunk_content,
+                    embedding=embedding,
+                )
+                db.add(chunk)
+
+            session.status = "COMPLETED"
+            session.processing_stage = "DONE"
+            session.upload_progress_percent = 100
+            await db.commit()
+
+            await connection_manager.send_to_channel(
+                connection_manager.channel_for_session(str(session_id)),
+                {"status": "completed"},
+            )
+        except openai.APIError as e:
+            logger.exception("OpenAI API error in process_lecture_background")
+            try:
+                session = await db.get(AILectureSession, session_id)
+                if session:
+                    session.status = "FAILED"
+                    session.processing_stage = "ERROR"
+                    await db.commit()
+                await connection_manager.send_to_channel(
+                    connection_manager.channel_for_session(str(session_id)),
+                    {"status": "failed", "error": str(e)},
+                )
+            except Exception:
+                pass
+        except Exception as e:
+            logger.exception("Error in process_lecture_background")
+            try:
+                session = await db.get(AILectureSession, session_id)
+                if session:
+                    session.status = "FAILED"
+                    session.processing_stage = "ERROR"
+                    await db.commit()
+                await connection_manager.send_to_channel(
+                    connection_manager.channel_for_session(str(session_id)),
+                    {"status": "failed", "error": str(e)},
+                )
+            except Exception:
+                pass
+        finally:
+            if audio_path and os.path.isfile(audio_path):
+                try:
+                    os.remove(audio_path)
+                except OSError as err:
+                    logger.warning("Could not remove temp file %s: %s", audio_path, err)
 
 
 async def update_transcript(
@@ -740,4 +768,24 @@ async def update_transcript(
     logger.info(f"Transcript updated and embeddings regenerated for lecture {lecture_id}")
 
     return lecture
+
+
+async def delete_lecture(
+    db: AsyncSession,
+    tenant_id: UUID,
+    user_id: UUID,
+    lecture_id: UUID,
+    is_admin: bool = False,
+) -> bool:
+    """Permanently delete a lecture (and its chunks/chats via cascades)."""
+    lecture = await db.get(AILectureSession, lecture_id)
+    if not lecture or lecture.tenant_id != tenant_id:
+        return False
+
+    if not is_admin and lecture.teacher_id != user_id:
+        raise ServiceError("You do not own this lecture", status.HTTP_403_FORBIDDEN)
+
+    await db.delete(lecture)
+    await db.commit()
+    return True
 
