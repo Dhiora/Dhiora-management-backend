@@ -21,6 +21,7 @@ from app.core.models.class_subject import ClassSubject
 from app.core.models.teacher_subject_assignment import TeacherSubjectAssignment
 from app.core.models.class_teacher_assignment import ClassTeacherAssignment
 from app.core.models.timetable import Timetable
+from app.core.models.time_slot import TimeSlot
 from app.core.models.student_daily_attendance import (
     StudentDailyAttendance,
     StudentDailyAttendanceRecord,
@@ -72,6 +73,7 @@ __all__ = [
     "TeacherSubjectAssignment",
     "ClassTeacherAssignment",
     "Timetable",
+    "TimeSlot",
     "StudentDailyAttendance",
     "StudentDailyAttendanceRecord",
     "StudentSubjectAttendanceOverride",

@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, Time
+from sqlalchemy import Column, DateTime, ForeignKey, Integer
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
@@ -26,8 +26,11 @@ class Timetable(Base):
     subject_id = Column(UUID(as_uuid=True), ForeignKey("school.subjects.id", ondelete="CASCADE"), nullable=False)
     teacher_id = Column(UUID(as_uuid=True), ForeignKey("auth.users.id", ondelete="RESTRICT"), nullable=False)
     day_of_week = Column(Integer, nullable=False)  # 0=Monday .. 6=Sunday
-    start_time = Column(Time, nullable=False)
-    end_time = Column(Time, nullable=False)
+    slot_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("school.time_slots.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
 
     tenant = relationship("Tenant")
@@ -36,3 +39,4 @@ class Timetable(Base):
     section = relationship("Section", foreign_keys=[section_id])
     subject = relationship("SchoolSubject")
     teacher = relationship("User", foreign_keys=[teacher_id])
+

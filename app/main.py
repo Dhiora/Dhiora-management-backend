@@ -20,6 +20,7 @@ from app.api.v1.leaves.router import router as leaves_router
 from app.api.v1.subjects.router import router as subjects_router
 from app.api.v1.class_subjects.router import router as class_subjects_router
 from app.api.v1.timetables.router import router as timetables_router
+from app.api.v1.time_slots.router import router as time_slots_router
 from app.api.v1.teacher_subject_assignments.router import router as teacher_subject_assignments_router
 from app.api.v1.class_teachers.router import router as class_teachers_router
 from app.api.v1.fee_components.router import router as fee_components_router
@@ -61,6 +62,7 @@ def create_app() -> FastAPI:
     app.include_router(subjects_router)
     app.include_router(class_subjects_router)
     app.include_router(timetables_router)
+    app.include_router(time_slots_router)
     app.include_router(teacher_subject_assignments_router)
     app.include_router(class_teachers_router)
     app.include_router(fee_components_router)

@@ -7,14 +7,23 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import ServiceError
-from app.core.models import AcademicYear, SchoolClass, SchoolSubject, Section, Timetable
+from app.core.models import AcademicYear, SchoolClass, SchoolSubject, Section, TimeSlot, Timetable
 
 from app.api.v1.class_subjects import service as class_subjects_service
 
-from .schemas import TimetableSlotCreate, TimetableSlotResponse, TimetableSlotUpdate
+from .schemas import TimeSlotInfo, TimetableSlotCreate, TimetableSlotResponse, TimetableSlotUpdate
 
 
-def _to_response(t: Timetable) -> TimetableSlotResponse:
+def _to_response(t: Timetable, slot: Optional[TimeSlot] = None) -> TimetableSlotResponse:
+    if slot is None:
+        slot = getattr(t, "time_slot", None)
+    slot_info = TimeSlotInfo(
+        id=slot.id,
+        name=slot.name,
+        start_time=slot.start_time.strftime("%H:%M") if slot else "",
+        end_time=slot.end_time.strftime("%H:%M") if slot else "",
+        slot_type=slot.slot_type if slot else "",
+    ) if slot else None
     return TimetableSlotResponse(
         id=t.id,
         tenant_id=t.tenant_id,
@@ -24,8 +33,7 @@ def _to_response(t: Timetable) -> TimetableSlotResponse:
         subject_id=t.subject_id,
         teacher_id=t.teacher_id,
         day_of_week=t.day_of_week,
-        start_time=t.start_time,
-        end_time=t.end_time,
+        slot=slot_info,
         created_at=t.created_at,
     )
 
@@ -56,8 +64,41 @@ async def create_timetable_slot(
             "Subject must be assigned to this class for this academic year (class_subjects) first",
             status.HTTP_400_BAD_REQUEST,
         )
-    if payload.end_time <= payload.start_time:
-        raise ServiceError("end_time must be after start_time", status.HTTP_400_BAD_REQUEST)
+    # Validate time slot belongs to tenant and is active
+    time_slot = await db.get(TimeSlot, payload.slot_id)
+    if not time_slot or time_slot.tenant_id != tenant_id or not time_slot.is_active:
+        raise ServiceError("Invalid time slot", status.HTTP_400_BAD_REQUEST)
+
+    # Prevent duplicate: same class + day_of_week + slot_id in same year
+    dup_stmt = select(Timetable.id).where(
+        Timetable.tenant_id == tenant_id,
+        Timetable.academic_year_id == payload.academic_year_id,
+        Timetable.class_id == payload.class_id,
+        Timetable.section_id == payload.section_id,
+        Timetable.day_of_week == payload.day_of_week,
+        Timetable.slot_id == payload.slot_id,
+    ).limit(1)
+    dup_result = await db.execute(dup_stmt)
+    if dup_result.scalar_one_or_none() is not None:
+        raise ServiceError(
+            "Timetable slot already exists for this class/section/day/slot",
+            status.HTTP_409_CONFLICT,
+        )
+
+    # Prevent teacher double-booking: same teacher + day_of_week + slot_id in same year
+    teacher_conflict_stmt = select(Timetable.id).where(
+        Timetable.tenant_id == tenant_id,
+        Timetable.academic_year_id == payload.academic_year_id,
+        Timetable.teacher_id == payload.teacher_id,
+        Timetable.day_of_week == payload.day_of_week,
+        Timetable.slot_id == payload.slot_id,
+    ).limit(1)
+    teacher_conflict = await db.execute(teacher_conflict_stmt)
+    if teacher_conflict.scalar_one_or_none() is not None:
+        raise ServiceError(
+            "Teacher already has a class in this slot for this day",
+            status.HTTP_409_CONFLICT,
+        )
     try:
         obj = Timetable(
             tenant_id=tenant_id,
@@ -67,8 +108,7 @@ async def create_timetable_slot(
             subject_id=payload.subject_id,
             teacher_id=payload.teacher_id,
             day_of_week=payload.day_of_week,
-            start_time=payload.start_time,
-            end_time=payload.end_time,
+            slot_id=payload.slot_id,
         )
         db.add(obj)
         await db.commit()
@@ -86,7 +126,9 @@ async def list_timetable_slots(
     class_id: Optional[UUID] = None,
     section_id: Optional[UUID] = None,
 ) -> List[TimetableSlotResponse]:
-    stmt = select(Timetable).where(
+    stmt = select(Timetable, TimeSlot).join(
+        TimeSlot, Timetable.slot_id == TimeSlot.id
+    ).where(
         Timetable.tenant_id == tenant_id,
         Timetable.academic_year_id == academic_year_id,
     )
@@ -94,9 +136,10 @@ async def list_timetable_slots(
         stmt = stmt.where(Timetable.class_id == class_id)
     if section_id is not None:
         stmt = stmt.where(Timetable.section_id == section_id)
-    stmt = stmt.order_by(Timetable.day_of_week, Timetable.start_time)
+    stmt = stmt.order_by(Timetable.day_of_week, TimeSlot.order_index)
     result = await db.execute(stmt)
-    return [_to_response(t) for t in result.scalars().all()]
+    rows = result.all()
+    return [_to_response(t, slot) for t, slot in rows]
 
 
 async def get_timetable_slot(
@@ -105,13 +148,16 @@ async def get_timetable_slot(
     slot_id: UUID,
 ) -> Optional[TimetableSlotResponse]:
     result = await db.execute(
-        select(Timetable).where(
+        select(Timetable, TimeSlot).join(TimeSlot, Timetable.slot_id == TimeSlot.id).where(
             Timetable.id == slot_id,
             Timetable.tenant_id == tenant_id,
         )
     )
-    obj = result.scalar_one_or_none()
-    return _to_response(obj) if obj else None
+    row = result.one_or_none()
+    if not row:
+        return None
+    t, slot = row
+    return _to_response(t, slot)
 
 
 async def update_timetable_slot(
@@ -131,16 +177,16 @@ async def update_timetable_slot(
         return None
     if payload.teacher_id is not None:
         obj.teacher_id = payload.teacher_id
-    if payload.start_time is not None:
-        obj.start_time = payload.start_time
-    if payload.end_time is not None:
-        obj.end_time = payload.end_time
-    if payload.start_time is not None or payload.end_time is not None:
-        if obj.end_time <= obj.start_time:
-            raise ServiceError("end_time must be after start_time", status.HTTP_400_BAD_REQUEST)
+    if payload.slot_id is not None:
+        time_slot = await db.get(TimeSlot, payload.slot_id)
+        if not time_slot or time_slot.tenant_id != tenant_id or not time_slot.is_active:
+            raise ServiceError("Invalid time slot", status.HTTP_400_BAD_REQUEST)
+        obj.slot_id = payload.slot_id
     await db.commit()
     await db.refresh(obj)
-    return _to_response(obj)
+    # load slot for response
+    slot = await db.get(TimeSlot, obj.slot_id)
+    return _to_response(obj, slot)
 
 
 async def delete_timetable_slot(
