@@ -1,7 +1,8 @@
 """AI Classroom API router."""
 
+import asyncio
 import json
-from typing import List, Optional
+from typing import Dict, List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status
@@ -26,6 +27,7 @@ from .schemas import (
     RecordingStartRequest,
     RecordingStartResponse,
     RecordingStatusResponse,
+    StopRecordingResponse,
     TranscriptUpdateRequest,
 )
 
@@ -50,10 +52,15 @@ def _lecture_to_response(lecture) -> LectureResponse:
         total_recording_seconds=lecture.total_recording_seconds,
         is_active_recording=lecture.is_active_recording,
         audio_buffer_size_bytes=lecture.audio_buffer_size_bytes,
+        upload_completed=getattr(lecture, "upload_completed", False),
+        audio_file_path=getattr(lecture, "audio_file_path", None),
+        processing_stage=getattr(lecture, "processing_stage", None),
+        last_chunk_received_at=getattr(lecture, "last_chunk_received_at", None),
+        upload_progress_percent=getattr(lecture, "upload_progress_percent", 0),
         created_at=lecture.created_at,
-        class_name=getattr(lecture, '_class_name', None),
-        subject_name=getattr(lecture, '_subject_name', None),
-        section_name=getattr(lecture, '_section_name', None),
+        class_name=getattr(lecture, "_class_name", None),
+        subject_name=getattr(lecture, "_subject_name", None),
+        section_name=getattr(lecture, "_section_name", None),
         session_name=lecture.title,
     )
 
@@ -155,6 +162,33 @@ async def get_lecture(
         if not lecture:
             raise ServiceError("Lecture not found", status.HTTP_404_NOT_FOUND)
         return _lecture_to_response(lecture)
+    except ServiceError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+
+
+@router.delete(
+    "/lectures/{lecture_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(check_permission("ai_classroom", "delete_lecture"))],
+)
+async def delete_lecture(
+    lecture_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Permanently delete a lecture and its related data."""
+    try:
+        is_admin = current_user.role in ("SUPER_ADMIN", "PLATFORM_ADMIN", "ADMIN")
+        deleted = await service.delete_lecture(
+        db,
+        current_user.tenant_id,
+        current_user.id,
+        lecture_id,
+        is_admin=is_admin,
+    )
+        if not deleted:
+            raise ServiceError("Lecture not found", status.HTTP_404_NOT_FOUND)
+        return
     except ServiceError as e:
         raise HTTPException(status_code=e.status_code, detail=e.message)
 
@@ -345,7 +379,7 @@ async def resume_recording(
 
 @router.post(
     "/recording/stop/{session_id}",
-    response_model=LectureResponse,
+    response_model=StopRecordingResponse,
     dependencies=[Depends(check_permission("ai_classroom", "update_lecture"))],
 )
 async def stop_recording(
@@ -354,13 +388,13 @@ async def stop_recording(
     current_user: CurrentUser = Depends(get_current_user),
 ):
     try:
-        session = await service.stop_recording(
+        await service.stop_recording(
             db,
             current_user.tenant_id,
             current_user.id,
             session_id,
         )
-        return _lecture_to_response(session)
+        return StopRecordingResponse(status="UPLOADING", message="Recording stopped. Uploading in progress.")
     except ServiceError as e:
         raise HTTPException(status_code=e.status_code, detail=e.message)
 
@@ -427,16 +461,32 @@ async def get_user_from_websocket_token(token: str, db: AsyncSession) -> Optiona
     )
 
 
+# In-memory upload state: session_id (str) -> { "total_size": int, "received_size": int }
+_upload_state: Dict[str, dict] = {}
+_upload_state_lock = asyncio.Lock()
+
+UPLOAD_DIR = "/tmp"
+
+
 @router.websocket("/recording/stream/{session_id}")
 async def websocket_stream(
     websocket: WebSocket,
     session_id: UUID,
     token: Optional[str] = None,
 ):
-    """WebSocket endpoint for streaming audio chunks."""
-    await websocket.accept()
+    """
+    WebSocket for upload-after-stop: teacher sends upload_start (total_size), then binary chunks,
+    then upload_complete. Server writes to /tmp/lecture_{session_id}.webm and reports progress.
+    On upload_complete, background processing runs and status 'completed'/'failed' is sent to this channel.
+    """
+    import logging
+    from datetime import datetime, timezone
 
+    from app.core.websocket import connection_manager
     from app.db.session import AsyncSessionLocal
+
+    logger = logging.getLogger(__name__)
+    await websocket.accept()
 
     async with AsyncSessionLocal() as db:
         try:
@@ -461,84 +511,112 @@ async def websocket_stream(
                 await websocket.close(code=1008)
                 return
 
-            if session.status != "RECORDING":
-                await websocket.send_json({"error": f"Session is not recording. Status: {session.status}"})
+            if session.status != "UPLOADING":
+                await websocket.send_json({
+                    "error": f"Session must be UPLOADING (call STOP first). Current: {session.status}",
+                })
                 await websocket.close(code=1008)
                 return
 
-            import logging
-            from app.api.v1.ai_classroom.audio_buffer_manager import buffer_manager
-
-            logger = logging.getLogger(__name__)
-
-            await buffer_manager.initialize(session_id)
-            logger.info(f"WebSocket connected for session {session_id}, teacher {current_user.id}")
+            channel_id = connection_manager.channel_for_session(str(session_id))
+            connection_manager.register(websocket, [channel_id])
 
             await websocket.send_json({
                 "status": "connected",
                 "session_id": str(session_id),
-                "message": "Send audio chunks as binary data. Audio will be transcribed when recording stops."
+                "message": "Send first message: {\"type\": \"upload_start\", \"total_size\": <bytes>}. Then binary chunks. Then {\"type\": \"upload_complete\"}.",
             })
 
-            MAX_BUFFER_SIZE = 200 * 1024 * 1024  # 200MB
+            sid_str = str(session_id)
+            file_path = f"{UPLOAD_DIR}/lecture_{session_id}.webm"
 
             while True:
                 try:
                     data = await websocket.receive()
 
-                    if "bytes" in data:
-                        audio_bytes = data["bytes"]
-
-                        if len(audio_bytes) < 1024:  # Ignore chunks < 1KB
+                    if "text" in data:
+                        try:
+                            msg = json.loads(data["text"])
+                        except json.JSONDecodeError:
+                            await websocket.send_json({"error": "Invalid JSON"})
                             continue
 
-                        session = await service.get_recording_session(
-                            db,
-                            current_user.tenant_id,
-                            session_id,
-                            teacher_id=current_user.id,
-                        )
+                        if msg.get("type") == "upload_start":
+                            total = msg.get("total_size")
+                            if total is None or not isinstance(total, (int, float)) or total <= 0:
+                                await websocket.send_json({"error": "upload_start requires total_size (positive number)"})
+                                continue
+                            async with _upload_state_lock:
+                                _upload_state[sid_str] = {"total_size": int(total), "received_size": 0}
+                            with open(file_path, "wb") as _:
+                                pass
+                            await websocket.send_json({"status": "upload_started", "total_size": int(total)})
+                            continue
 
-                        if not session or session.status != "RECORDING":
-                            await websocket.send_json({"error": "Session is no longer recording"})
-                            break
-
-                        current_size = await buffer_manager.append_chunk(session_id, audio_bytes)
-
-                        if current_size > MAX_BUFFER_SIZE:
-                            logger.error(f"Buffer size {current_size} exceeds limit for session {session_id}")
+                        if msg.get("type") == "upload_complete":
+                            session = await service.get_recording_session(
+                                db, current_user.tenant_id, session_id, teacher_id=current_user.id
+                            )
+                            if not session or session.status != "UPLOADING":
+                                await websocket.send_json({"error": "Session not in UPLOADING state"})
+                                break
+                            session.upload_completed = True
                             session.status = "PROCESSING"
-                            session.is_active_recording = False
+                            session.processing_stage = "TRANSCRIBING"
+                            session.audio_file_path = file_path
                             await db.commit()
-                            await buffer_manager.clear(session_id)
-                            await websocket.send_json({
-                                "error": "Buffer size limit exceeded (200MB). Recording stopped automatically."
-                            })
+                            asyncio.create_task(service.process_lecture_background(session_id))
+                            await websocket.send_json({"status": "processing"})
+                            async with _upload_state_lock:
+                                _upload_state.pop(sid_str, None)
                             break
 
-                        session.audio_buffer_size_bytes = current_size
-                        await db.commit()
+                    if "bytes" in data:
+                        audio_bytes = data["bytes"]
+                        if not audio_bytes:
+                            continue
+                        async with _upload_state_lock:
+                            state = _upload_state.get(sid_str)
+                        if not state:
+                            await websocket.send_json({"error": "Send upload_start with total_size first"})
+                            continue
+                        with open(file_path, "ab") as f:
+                            f.write(audio_bytes)
+                        async with _upload_state_lock:
+                            _upload_state[sid_str]["received_size"] += len(audio_bytes)
+                            received = _upload_state[sid_str]["received_size"]
+                            total = _upload_state[sid_str]["total_size"]
+                        progress = min(100, int((received / total) * 100)) if total else 0
 
-                        logger.debug(f"Chunk received for session {session_id}, buffer size: {current_size} bytes")
-
-                        await websocket.send_json({
-                            "status": "chunk_received",
-                            "size": current_size,
-                        })
-
+                        session = await service.get_recording_session(
+                            db, current_user.tenant_id, session_id, teacher_id=current_user.id
+                        )
+                        if session and session.status == "UPLOADING":
+                            session.upload_progress_percent = progress
+                            session.last_chunk_received_at = datetime.now(timezone.utc)
+                            await db.commit()
+                        await websocket.send_json({"status": "uploading", "progress": progress})
 
                 except WebSocketDisconnect:
                     break
                 except Exception as e:
+                    logger.exception("WebSocket stream error")
                     await websocket.send_json({"error": f"Processing error: {str(e)}"})
                     break
 
         except Exception as e:
+            logger.exception("WebSocket stream connection error")
             try:
-                await websocket.send_json({"error": f"Connection error: {str(e)}"})
+                await websocket.send_json({"error": str(e)})
             except Exception:
                 pass
         finally:
+            async with _upload_state_lock:
+                _upload_state.pop(str(session_id), None)
+            try:
+                await connection_manager.disconnect(websocket)
+            except Exception:
+                pass
             try:
                 await websocket.close()
             except Exception:

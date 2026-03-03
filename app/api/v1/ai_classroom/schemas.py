@@ -32,6 +32,11 @@ class LectureResponse(BaseModel):
     total_recording_seconds: int
     is_active_recording: bool
     audio_buffer_size_bytes: int
+    upload_completed: bool = False
+    audio_file_path: Optional[str] = None
+    processing_stage: Optional[str] = None
+    last_chunk_received_at: Optional[datetime] = None
+    upload_progress_percent: int = 0
     created_at: datetime
     class_name: Optional[str] = None
     subject_name: Optional[str] = None
@@ -93,6 +98,13 @@ class RecordingStatusResponse(BaseModel):
     session_id: UUID
     status: str
     message: str
+
+
+class StopRecordingResponse(BaseModel):
+    """Returned by POST /recording/stop/{session_id}. Frontend then opens WebSocket to upload audio."""
+
+    status: str = "UPLOADING"
+    message: str = "Recording stopped. Uploading in progress."
 
 
 class TranscriptUpdateRequest(BaseModel):

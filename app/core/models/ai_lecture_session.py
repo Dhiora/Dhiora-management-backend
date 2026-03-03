@@ -30,12 +30,19 @@ class AILectureSession(Base):
     title = Column(String(255), nullable=False)
     transcript = Column(Text, nullable=False, default="")
     structured_notes = Column(JSONB, nullable=True)
-    status = Column(String(20), nullable=False, default="IDLE")  # IDLE, RECORDING, PAUSED, PROCESSING, COMPLETED
+    status = Column(
+        String(20), nullable=False, default="IDLE"
+    )  # IDLE, RECORDING, PAUSED, UPLOADING, PROCESSING, COMPLETED, FAILED
     recording_started_at = Column(DateTime(timezone=True), nullable=True)
     recording_paused_at = Column(DateTime(timezone=True), nullable=True)
     total_recording_seconds = Column(Integer, nullable=False, default=0)
     is_active_recording = Column(Boolean, nullable=False, default=False)
     audio_buffer_size_bytes = Column(Integer, nullable=False, default=0)
+    upload_completed = Column(Boolean, nullable=False, default=False)
+    audio_file_path = Column(String(1024), nullable=True)
+    processing_stage = Column(String(50), nullable=True)
+    last_chunk_received_at = Column(DateTime(timezone=True), nullable=True)
+    upload_progress_percent = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
 
     chunks = relationship("AILectureChunk", back_populates="lecture_session", cascade="all, delete-orphan")

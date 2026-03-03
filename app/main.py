@@ -26,6 +26,7 @@ from app.api.v1.fee_components.router import router as fee_components_router
 from app.api.v1.fees.router import router as fees_router
 from app.api.v1.transport.router import router as transport_router
 from app.api.v1.ai_classroom.router import router as ai_classroom_router
+from app.api.v1.ws.router import router as ws_router
 
 
 def create_app() -> FastAPI:
@@ -66,6 +67,7 @@ def create_app() -> FastAPI:
     app.include_router(fees_router)
     app.include_router(transport_router)
     app.include_router(ai_classroom_router)
+    app.include_router(ws_router)
 
     return app
 
