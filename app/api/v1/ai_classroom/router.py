@@ -18,6 +18,7 @@ from app.db.session import get_db
 
 from . import service
 from .schemas import (
+    AdminDoubtRequest,
     DoubtAskRequest,
     DoubtAskResponse,
     DoubtChatResponse,
@@ -27,6 +28,7 @@ from .schemas import (
     RecordingStartRequest,
     RecordingStartResponse,
     RecordingStatusResponse,
+    StudentDoubtRequest,
     StopRecordingResponse,
     TranscriptUpdateRequest,
 )
@@ -231,6 +233,62 @@ async def ask_doubt(
 ):
     try:
         chat, ai_message = await service.ask_doubt(
+            db,
+            current_user.tenant_id,
+            current_user.id,
+            payload,
+        )
+        return DoubtAskResponse(
+            chat_id=chat.id,
+            answer=ai_message.message,
+            message=_message_to_response(ai_message),
+        )
+    except ServiceError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+
+
+@router.post(
+    "/doubt/student",
+    response_model=DoubtAskResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(get_current_user)],
+    tags=["AI Classroom"],
+)
+async def ask_doubt_student(
+    payload: StudentDoubtRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    try:
+        chat, ai_message = await service.ask_doubt_student(
+            db,
+            current_user.tenant_id,
+            current_user.id,
+            payload,
+        )
+        return DoubtAskResponse(
+            chat_id=chat.id,
+            answer=ai_message.message,
+            message=_message_to_response(ai_message),
+        )
+    except ServiceError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+
+
+@router.post(
+    "/doubt/admin",
+    response_model=DoubtAskResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(get_current_user)],
+    tags=["AI Classroom"],
+)
+async def ask_doubt_admin(
+    payload: AdminDoubtRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    try:
+        chat, ai_message = await service.ask_doubt_admin(
             db,
             current_user.tenant_id,
             current_user.id,

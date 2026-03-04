@@ -12,6 +12,7 @@ from app.api.v1.departments.department_router import router as departments_route
 from app.api.v1.modules.router import router as modules_router
 from app.api.v1.sections.sections_router import router as sections_router
 from app.api.v1.subscription_plans.router import router as subscription_plans_router
+from app.api.v1.subscriptions.router import router as subscriptions_router
 from app.api.v1.modules.users.employee_router import router as employees_router
 from app.api.v1.modules.users.student_router import router as students_router
 from app.api.v1.query.query_router import router as query_router
@@ -54,6 +55,7 @@ def create_app() -> FastAPI:
     app.include_router(sections_router)
     app.include_router(modules_router)
     app.include_router(subscription_plans_router)
+    app.include_router(subscriptions_router)
     app.include_router(employees_router)
     app.include_router(students_router)
     app.include_router(query_router)

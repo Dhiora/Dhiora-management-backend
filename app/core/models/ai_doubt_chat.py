@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, ForeignKey, Index, UUID as SQLUUID
+from sqlalchemy import Column, DateTime, ForeignKey, Index, String, UUID as SQLUUID
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
@@ -25,6 +25,7 @@ class AIDoubtChat(Base):
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("core.tenants.id", ondelete="CASCADE"), nullable=False, index=True)
     student_id = Column(UUID(as_uuid=True), ForeignKey("auth.users.id", ondelete="CASCADE"), nullable=False, index=True)
     lecture_id = Column(UUID(as_uuid=True), ForeignKey("school.ai_lecture_sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    session_stage = Column(String(50), nullable=True)  # ULTRA: START | TEACHING | CHALLENGING | EVALUATING
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
 
     lecture_session = relationship("AILectureSession", back_populates="doubt_chats")

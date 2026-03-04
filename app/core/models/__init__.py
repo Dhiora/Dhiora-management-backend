@@ -28,6 +28,7 @@ from app.core.models.student_daily_attendance import (
 )
 from app.core.models.student_subject_attendance_override import StudentSubjectAttendanceOverride
 from app.core.models.subscription_plan import SubscriptionPlan
+from app.core.models.tenant_subscription import TenantSubscription
 from app.core.models.referral_usage import ReferralUsage
 from app.core.models.tenant import Tenant, TenantModule
 from app.core.models.admission_request import AdmissionRequest
@@ -80,6 +81,7 @@ __all__ = [
     "StudentAttendance",
     "ReferralUsage",
     "SubscriptionPlan",
+    "TenantSubscription",
     "TeacherClassAssignment",
     "Tenant",
     "TenantModule",

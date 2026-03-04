@@ -34,6 +34,8 @@ class User(Base):
     source = Column(String(50), nullable=False, default="SYSTEM")
     # employee | student | null (for admin users)
     user_type = Column(String(50), nullable=True)
+    # AI doubt tier: BASIC | PRO | ULTRA (default BASIC when null)
+    subscription_plan = Column(String(50), nullable=True)
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
 
     # Tenant relationship (lazy-loaded)

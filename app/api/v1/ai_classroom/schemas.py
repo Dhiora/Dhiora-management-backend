@@ -1,7 +1,7 @@
 """AI Classroom schemas."""
 
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -50,6 +50,35 @@ class LectureResponse(BaseModel):
 class DoubtAskRequest(BaseModel):
     lecture_id: UUID
     question: str = Field(..., min_length=1)
+
+
+class StudentDoubtRequest(BaseModel):
+    lecture_id: UUID
+    subject_name: str  # e.g. "Physics"
+    topic_name: str  # e.g. "Newton's Laws"
+    message: str = Field(..., min_length=1)
+    chat_id: Optional[UUID] = None  # None = new chat, UUID = continue existing
+
+    # Pro plan only — ignored in BASIC
+    message_type: Optional[Literal["QUESTION", "ANSWER"]] = "QUESTION"
+
+    # Ultra plan only — ignored in BASIC and PRO
+    session_stage: Optional[Literal["START", "TEACHING", "CHALLENGING", "EVALUATING"]] = "START"
+
+
+class AdminDoubtRequest(BaseModel):
+    lecture_id: UUID
+    subject_name: str
+    topic_name: str
+    message: str = Field(..., min_length=1)
+    chat_id: Optional[UUID] = None
+    tier: Literal["BASIC", "PRO", "ULTRA"]  # admin picks which mode to use
+
+    # Pro plan fields
+    message_type: Optional[Literal["QUESTION", "ANSWER"]] = "QUESTION"
+
+    # Ultra plan fields
+    session_stage: Optional[Literal["START", "TEACHING", "CHALLENGING", "EVALUATING"]] = "START"
 
 
 class DoubtMessageResponse(BaseModel):

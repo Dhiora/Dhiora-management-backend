@@ -26,7 +26,13 @@ from app.core.models import (
     Section,
 )
 
-from .schemas import DoubtAskRequest, LectureCreate, RecordingStartRequest
+from .schemas import (
+    AdminDoubtRequest,
+    DoubtAskRequest,
+    LectureCreate,
+    RecordingStartRequest,
+    StudentDoubtRequest,
+)
 
 client = AsyncOpenAI(api_key=settings.openai_api_key)
 
@@ -283,6 +289,369 @@ If the answer is not found in the context, politely say that this topic was not 
     await db.refresh(ai_message)
 
     return chat_obj, ai_message
+
+
+async def get_chat_history(db: AsyncSession, chat_id: UUID) -> List[dict]:
+    """
+    Return last 20 messages from AIDoubtMessage for a given chat_id.
+    Map role: "STUDENT" → "user", "AI" → "assistant"
+    Order by created_at ascending.
+    Return as List[dict] with keys: "role", "content"
+    """
+    stmt = (
+        select(AIDoubtMessage)
+        .where(AIDoubtMessage.chat_id == chat_id)
+        .order_by(AIDoubtMessage.created_at.desc())
+        .limit(20)
+    )
+    result = await db.execute(stmt)
+    rows = result.scalars().all()
+    # Reverse so chronological order (oldest first)
+    ordered = list(reversed(rows))
+    return [
+        {
+            "role": "user" if m.role == "STUDENT" else "assistant",
+            "content": m.message,
+        }
+        for m in ordered
+    ]
+
+
+async def get_similar_chunks(
+    db: AsyncSession,
+    tenant_id: UUID,
+    lecture_id: UUID,
+    query: str,
+    limit: int = 5,
+) -> List[str]:
+    """
+    Generate embedding for query, run pgvector similarity search on
+    school.ai_lecture_chunks, return top `limit` chunk contents as List[str].
+    Use same SQL pattern as existing ask_doubt() function.
+    """
+    embedding = await generate_embedding(query)
+    embedding_str = "[" + ",".join(map(str, embedding)) + "]"
+    stmt = text("""
+        SELECT content
+        FROM school.ai_lecture_chunks
+        WHERE tenant_id = :tenant_id
+        AND lecture_id = :lecture_id
+        ORDER BY embedding <-> (:question_embedding)::vector
+        LIMIT :limit
+    """)
+    result = await db.execute(
+        stmt,
+        {
+            "tenant_id": str(tenant_id),
+            "lecture_id": str(lecture_id),
+            "question_embedding": embedding_str,
+            "limit": limit,
+        },
+    )
+    return [row[0] for row in result.fetchall()]
+
+
+async def _get_or_create_doubt_chat(
+    db: AsyncSession,
+    tenant_id: UUID,
+    user_id: UUID,
+    lecture_id: UUID,
+    chat_id: Optional[UUID],
+) -> AIDoubtChat:
+    """Get existing chat by chat_id (with validation) or by (tenant, user, lecture); create if missing."""
+    if chat_id:
+        chat_obj = await db.get(AIDoubtChat, chat_id)
+        if not chat_obj or chat_obj.tenant_id != tenant_id or chat_obj.student_id != user_id or chat_obj.lecture_id != lecture_id:
+            raise ServiceError("Chat not found", status.HTTP_404_NOT_FOUND)
+        return chat_obj
+    chat = await db.execute(
+        select(AIDoubtChat).where(
+            AIDoubtChat.tenant_id == tenant_id,
+            AIDoubtChat.student_id == user_id,
+            AIDoubtChat.lecture_id == lecture_id,
+        )
+    )
+    chat_obj = chat.scalar_one_or_none()
+    if not chat_obj:
+        chat_obj = AIDoubtChat(
+            tenant_id=tenant_id,
+            student_id=user_id,
+            lecture_id=lecture_id,
+        )
+        db.add(chat_obj)
+        await db.flush()
+    return chat_obj
+
+
+async def _handle_basic_doubt(
+    db: AsyncSession,
+    tenant_id: UUID,
+    user_id: UUID,
+    lecture_id: UUID,
+    subject_name: str,
+    topic_name: str,
+    message: str,
+    chat_id: Optional[UUID],
+) -> Tuple[AIDoubtChat, AIDoubtMessage]:
+    chunks = await get_similar_chunks(db, tenant_id, lecture_id, message, limit=5)
+    context = "\n\n".join(chunks)
+    system_prompt = (
+        f"You are a helpful teacher assistant for {subject_name}, topic: {topic_name}. "
+        "Answer the student's question ONLY using the lecture content provided below. "
+        f"If the answer is not in the lecture content, respond with: "
+        f"'This was not covered in today's lecture on {topic_name}.' "
+        "Keep answers clear, simple, and encouraging. Do not go beyond the lecture content."
+    )
+    try:
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Lecture content:\n\n{context}\n\n\nStudent question: {message}"},
+            ],
+            temperature=0.5,
+        )
+        ai_answer = response.choices[0].message.content
+    except openai.APIError as e:
+        raise ServiceError(f"OpenAI API error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception as e:
+        raise ServiceError(f"Error generating answer: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
+    chat_obj = await _get_or_create_doubt_chat(db, tenant_id, user_id, lecture_id, chat_id)
+    student_message = AIDoubtMessage(chat_id=chat_obj.id, role="STUDENT", message=message)
+    db.add(student_message)
+    ai_message = AIDoubtMessage(chat_id=chat_obj.id, role="AI", message=ai_answer)
+    db.add(ai_message)
+    await db.commit()
+    await db.refresh(chat_obj)
+    await db.refresh(ai_message)
+    return chat_obj, ai_message
+
+
+async def _handle_pro_doubt(
+    db: AsyncSession,
+    tenant_id: UUID,
+    user_id: UUID,
+    lecture_id: UUID,
+    subject_name: str,
+    topic_name: str,
+    message: str,
+    chat_id: Optional[UUID],
+    message_type: str,
+) -> Tuple[AIDoubtChat, AIDoubtMessage]:
+    chunks = await get_similar_chunks(db, tenant_id, lecture_id, message, limit=5)
+    context = "\n\n".join(chunks)
+    history = await get_chat_history(db, chat_id) if chat_id else []
+    if message_type == "QUESTION":
+        system_prompt = (
+            f"You are an expert teacher for {subject_name}, topic: {topic_name}. "
+            "STEP 1: Answer the student's question clearly using only the lecture content below. "
+            "STEP 2: After your answer, always end with ONE comprehension check question. "
+            "Format it exactly as: 'Quick check: [your question]' "
+            f"Lecture content:\n{context}\n\nRules: "
+            "Answer only from lecture content. "
+            "Comprehension question must be about what you just explained. Be encouraging and clear."
+        )
+    else:
+        system_prompt = (
+            f"You are an expert teacher for {subject_name}, topic: {topic_name}. "
+            "The student just answered your comprehension check question. "
+            "STEP 1: Evaluate if their answer is correct or not. "
+            "STEP 2A: If CORRECT → Praise briefly + ask 'Do you have any other doubts?' "
+            "STEP 2B: If WRONG or INCOMPLETE → Gently say it is not quite right; "
+            "Re-explain using a DIFFERENT approach (use analogy, real example, or simpler breakdown); "
+            "Ask the same comprehension question again but phrased differently. "
+            f"Lecture content:\n{context}"
+        )
+    messages = [{"role": "system", "content": system_prompt}]
+    for h in history:
+        messages.append({"role": h["role"], "content": h["content"]})
+    messages.append({"role": "user", "content": message})
+    try:
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages,
+            temperature=0.7,
+        )
+        ai_answer = response.choices[0].message.content
+    except openai.APIError as e:
+        raise ServiceError(f"OpenAI API error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception as e:
+        raise ServiceError(f"Error generating answer: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
+    chat_obj = await _get_or_create_doubt_chat(db, tenant_id, user_id, lecture_id, chat_id)
+    student_message = AIDoubtMessage(chat_id=chat_obj.id, role="STUDENT", message=message)
+    db.add(student_message)
+    ai_message = AIDoubtMessage(chat_id=chat_obj.id, role="AI", message=ai_answer)
+    db.add(ai_message)
+    await db.commit()
+    await db.refresh(chat_obj)
+    await db.refresh(ai_message)
+    return chat_obj, ai_message
+
+
+async def _handle_ultra_doubt(
+    db: AsyncSession,
+    tenant_id: UUID,
+    user_id: UUID,
+    lecture_id: UUID,
+    subject_name: str,
+    topic_name: str,
+    message: str,
+    chat_id: Optional[UUID],
+    session_stage: str,
+) -> Tuple[AIDoubtChat, AIDoubtMessage]:
+    chunks = await get_similar_chunks(db, tenant_id, lecture_id, topic_name, limit=5)
+    context = "\n\n".join(chunks)
+    history_raw = await get_chat_history(db, chat_id) if chat_id else []
+    history = history_raw[-10:]  # last 10 messages
+    stage_prompts = {
+        "START": (
+            f"You are an elite IIT-level mentor for {subject_name}. Today's topic: {topic_name}. "
+            f"Lecture content:\n{context}\n\nYour task: "
+            "Give a sharp 3-line recap of what was taught in the lecture. "
+            "Say: 'Now let me show you what IIT toppers know about this that most students miss'. "
+            f"Share ONE advanced insight about {topic_name} that goes beyond the lecture. "
+            "End with: 'Ready to be challenged at the next level? Reply yes to begin.' "
+            "Tone: Confident, exciting, like a mentor who believes in this student."
+        ),
+        "TEACHING": (
+            f"You are an elite IIT-level mentor for {subject_name}, topic: {topic_name}. "
+            "The student wants to go deeper. You are in TEACHING mode. "
+            "Your task: Teach the advanced version of {topic_name} beyond what the lecture covered. "
+            "Show how this topic appears in real IIT exam questions. "
+            "Teach one powerful problem-solving technique IIT toppers use for this topic. "
+            "End with: 'Now I will give you 3 questions — easy to IIT-hard. Type ready when you are.' "
+            f"Lecture base:\n{context}"
+        ),
+        "CHALLENGING": (
+            f"You are an IIT-level examiner for {subject_name}, topic: {topic_name}. "
+            "You are in CHALLENGE mode. Ask 3 questions progressively: "
+            "Question 1: Board/NCERT level (build confidence); "
+            "Question 2: JEE Mains level (push them); "
+            "Question 3: JEE Advanced level (real IIT challenge). "
+            "Rules for each answer: CORRECT → Praise + explain the deeper insight + move to next question. "
+            "WRONG → Identify the exact mistake + explain the correct approach + ask a different question at the same difficulty. "
+            "'I don't know' → Teach that concept clearly + ask a simpler version of same question. "
+            "Always show: 'Question [X] of 3' at the start of each question. "
+            "After all 3 questions are done, tell student to type 'evaluate me'. "
+            f"Lecture content:\n{context}"
+        ),
+        "EVALUATING": (
+            f"You are an IIT mentor giving end-of-session feedback for {topic_name}. "
+            "Based on this conversation, give the student: "
+            "A score: X/10 for this session with one sentence explanation. "
+            "What they understood well (be specific, not generic). "
+            "One or two gaps they need to work on. "
+            "ONE homework problem at IIT level to solve before next class. "
+            "A closing motivational message — make it personal to what THEY showed in this session, not a generic 'you can do it'. "
+            "This should feel like a real mentor's honest debrief, not a report card."
+        ),
+    }
+    system_prompt = stage_prompts.get(session_stage, stage_prompts["START"])
+    messages = [{"role": "system", "content": system_prompt}]
+    for h in history:
+        messages.append({"role": h["role"], "content": h["content"]})
+    if message:
+        messages.append({"role": "user", "content": message})
+    try:
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages,
+            temperature=0.8,
+        )
+        ai_answer = response.choices[0].message.content
+    except openai.APIError as e:
+        raise ServiceError(f"OpenAI API error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception as e:
+        raise ServiceError(f"Error generating answer: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
+    chat_obj = await _get_or_create_doubt_chat(db, tenant_id, user_id, lecture_id, chat_id)
+    chat_obj.session_stage = session_stage
+    student_message = AIDoubtMessage(chat_id=chat_obj.id, role="STUDENT", message=message)
+    db.add(student_message)
+    ai_message = AIDoubtMessage(chat_id=chat_obj.id, role="AI", message=ai_answer)
+    db.add(ai_message)
+    await db.commit()
+    await db.refresh(chat_obj)
+    await db.refresh(ai_message)
+    return chat_obj, ai_message
+
+
+async def ask_doubt_student(
+    db: AsyncSession,
+    tenant_id: UUID,
+    student_id: UUID,
+    payload: StudentDoubtRequest,
+) -> Tuple[AIDoubtChat, AIDoubtMessage]:
+    """
+    Student doubt endpoint. Auto-routes to BASIC/PRO/ULTRA based on
+    student's subscription_plan field on User model.
+    """
+    user = await db.get(User, student_id)
+    if not user or user.tenant_id != tenant_id:
+        raise ServiceError("Student not found", status.HTTP_404_NOT_FOUND)
+    if user.user_type != "student":
+        raise ServiceError("Only students can use this endpoint", status.HTTP_403_FORBIDDEN)
+    lecture = await db.get(AILectureSession, payload.lecture_id)
+    if not lecture or lecture.tenant_id != tenant_id:
+        raise ServiceError("Lecture not found", status.HTTP_404_NOT_FOUND)
+    plan = getattr(user, "subscription_plan", "BASIC")
+    if plan not in ("BASIC", "PRO", "ULTRA"):
+        plan = "BASIC"
+    if plan == "BASIC":
+        return await _handle_basic_doubt(
+            db, tenant_id, student_id, payload.lecture_id,
+            payload.subject_name, payload.topic_name, payload.message, payload.chat_id,
+        )
+    if plan == "PRO":
+        return await _handle_pro_doubt(
+            db, tenant_id, student_id, payload.lecture_id,
+            payload.subject_name, payload.topic_name, payload.message, payload.chat_id,
+            payload.message_type or "QUESTION",
+        )
+    return await _handle_ultra_doubt(
+        db, tenant_id, student_id, payload.lecture_id,
+        payload.subject_name, payload.topic_name, payload.message, payload.chat_id,
+        payload.session_stage or "START",
+    )
+
+
+async def ask_doubt_admin(
+    db: AsyncSession,
+    tenant_id: UUID,
+    admin_id: UUID,
+    payload: AdminDoubtRequest,
+) -> Tuple[AIDoubtChat, AIDoubtMessage]:
+    """
+    Admin doubt endpoint. Admin explicitly passes tier in request body.
+    """
+    user = await db.get(User, admin_id)
+    if not user or user.tenant_id != tenant_id:
+        raise ServiceError("Admin user not found", status.HTTP_404_NOT_FOUND)
+    is_admin = user.role in ("SUPER_ADMIN", "PLATFORM_ADMIN", "ADMIN") or user.user_type == "employee"
+    if not is_admin:
+        raise ServiceError("Only admins or employees can use this endpoint", status.HTTP_403_FORBIDDEN)
+    lecture = await db.get(AILectureSession, payload.lecture_id)
+    if not lecture or lecture.tenant_id != tenant_id:
+        raise ServiceError("Lecture not found", status.HTTP_404_NOT_FOUND)
+    logging.getLogger(__name__).info(
+        "Admin %s using tier %s for lecture %s", admin_id, payload.tier, payload.lecture_id
+    )
+    tier = payload.tier
+    if tier == "BASIC":
+        return await _handle_basic_doubt(
+            db, tenant_id, admin_id, payload.lecture_id,
+            payload.subject_name, payload.topic_name, payload.message, payload.chat_id,
+        )
+    if tier == "PRO":
+        return await _handle_pro_doubt(
+            db, tenant_id, admin_id, payload.lecture_id,
+            payload.subject_name, payload.topic_name, payload.message, payload.chat_id,
+            payload.message_type or "QUESTION",
+        )
+    return await _handle_ultra_doubt(
+        db, tenant_id, admin_id, payload.lecture_id,
+        payload.subject_name, payload.topic_name, payload.message, payload.chat_id,
+        payload.session_stage or "START",
+    )
 
 
 async def get_lecture(

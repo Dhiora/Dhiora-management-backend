@@ -19,6 +19,9 @@ class Settings(BaseSettings):
 
     openai_api_key: str = Field(..., alias="OPENAI_API_KEY")
 
+    razorpay_key_id: Optional[str] = Field(None, alias="RAZORPAY_KEY_ID")
+    razorpay_key_secret: Optional[str] = Field(None, alias="RAZORPAY_KEY_SECRET")
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
