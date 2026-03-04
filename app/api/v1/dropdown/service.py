@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.v1.academic_years import service as academic_years_service
 from app.api.v1.classes import service as class_service
 from app.api.v1.class_subjects import service as class_subjects_service
+from app.api.v1.time_slots import service as time_slots_service
 from app.api.v1.modules.users import service as users_service
 from app.api.v1.sections import service as section_service
 
@@ -19,6 +20,7 @@ from .schemas import (
     SectionDropdownItem,
     SubjectDropdownItem,
     TeacherDropdownItem,
+    TimeSlotDropdownItem,
 )
 
 
@@ -39,6 +41,7 @@ async def get_classes_sections_dropdown(
     List[ClassOnlyDropdownItem],
     List[ClassWithSectionsDropdownItem],
     List[ClassWithSectionsAndSubjectsDropdownItem],
+    List[TimeSlotDropdownItem],
 ]:
     """
     Get dropdown data by indicator.
@@ -47,6 +50,7 @@ async def get_classes_sections_dropdown(
     - indicator=C: list of { className, classId } (no sections key).
     - indicator=CS: list of { className, classId, sections: [...] } (sections for given academic year).
     - indicator=CSS: list of { className, classId, sections: [...], subjects: [...] } for given academic year.
+    - indicator=TS: list of { label: 'HH:MM - HH:MM', value: slotId } for active time slots.
     """
     indicator = (indicator or "").strip().upper()
 
@@ -68,6 +72,16 @@ async def get_classes_sections_dropdown(
                 teacherName=emp.full_name or "",
             )
             for emp in employees
+        ]
+
+    if indicator == "TS":
+        slots = await time_slots_service.list_time_slots(db, tenant_id)
+        return [
+            TimeSlotDropdownItem(
+                label=f"{s.start_time.strftime('%H:%M')} - {s.end_time.strftime('%H:%M')}",
+                value=_to_uuid(s.id),
+            )
+            for s in slots
         ]
 
     classes = await class_service.list_classes(db, tenant_id, active_only=True)

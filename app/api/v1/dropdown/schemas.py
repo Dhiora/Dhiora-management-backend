@@ -69,3 +69,12 @@ class ClassWithSectionsAndSubjectsDropdownItem(BaseModel):
 
     class Config:
         populate_by_name = True
+
+
+class TimeSlotDropdownItem(BaseModel):
+    """Time slot (indicator=TS)."""
+    label: str = Field(..., description="Display label, e.g. '09:00 - 09:45'")
+    value: UUID = Field(..., description="Time slot UUID")
+
+    class Config:
+        populate_by_name = True

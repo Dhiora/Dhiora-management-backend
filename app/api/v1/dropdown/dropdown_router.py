@@ -15,6 +15,7 @@ from .schemas import (
     ClassWithSectionsDropdownItem,
     ClassWithSectionsAndSubjectsDropdownItem,
     TeacherDropdownItem,
+    TimeSlotDropdownItem,
 )
 from . import service
 
@@ -27,7 +28,9 @@ async def get_dropdown_indicator_and_check_permission(
         description=(
             "AY = academic years; T = teachers (employees); "
             "C = classes only; CS = classes with sections nested; "
-            "CSS = classes with sections and subjects nested"
+            "CSS = classes with sections and subjects nested; "
+            "TS = time slots (start-end)"
+            
         ),
         min_length=1,
         max_length=5,
@@ -46,6 +49,10 @@ async def get_dropdown_indicator_and_check_permission(
         perms = (current_user.permissions or {}).get("employees") or {}
         if not perms.get("read", False):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+    elif ind == "TS":
+        perms = (current_user.permissions or {}).get("timetables") or {}
+        if not perms.get("read", False):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
     else:
         perms = (current_user.permissions or {}).get("classes") or {}
         if not perms.get("read", False):
@@ -62,6 +69,7 @@ async def get_dropdown_indicator_and_check_permission(
             ClassOnlyDropdownItem,
             ClassWithSectionsDropdownItem,
             ClassWithSectionsAndSubjectsDropdownItem,
+            TimeSlotDropdownItem,
         ]
     ],
 )
@@ -77,6 +85,7 @@ async def get_classes_sections_dropdown(
     - **indicator=C**: Returns [{ className, classId }, ...] (no sections key).
     - **indicator=CS**: Returns [{ className, classId, sections: [{ sectionName, sectionId }, ...] }, ...].
     - **indicator=CSS**: Returns [{ className, classId, sections: [...], subjects: [{ subjectName, subjectId }, ...] }, ...].
+    - **indicator=TS**: Returns [{ label: 'HH:MM - HH:MM', value: slotId }, ...] for active time slots.
     """
     return await service.get_classes_sections_dropdown(
         db, current_user.tenant_id, indicator, academic_year_id=current_user.academic_year_id
