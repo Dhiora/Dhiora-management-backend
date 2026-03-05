@@ -21,7 +21,13 @@ from app.api.v1.class_subjects import service as class_subjects_service
 from .schemas import TeacherSubjectAssignmentCreate, TeacherSubjectAssignmentResponse
 
 
-def _to_response(t: TeacherSubjectAssignment) -> TeacherSubjectAssignmentResponse:
+def _to_response(
+    t: TeacherSubjectAssignment,
+    teacher_name: Optional[str] = None,
+    class_name: Optional[str] = None,
+    section_name: Optional[str] = None,
+    subject_name: Optional[str] = None,
+) -> TeacherSubjectAssignmentResponse:
     return TeacherSubjectAssignmentResponse(
         id=t.id,
         tenant_id=t.tenant_id,
@@ -31,6 +37,10 @@ def _to_response(t: TeacherSubjectAssignment) -> TeacherSubjectAssignmentRespons
         section_id=t.section_id,
         subject_id=t.subject_id,
         created_at=t.created_at,
+        teacher_name=teacher_name,
+        class_name=class_name,
+        section_name=section_name,
+        subject_name=subject_name,
     )
 
 
@@ -75,7 +85,13 @@ async def create_teacher_subject_assignment(
         db.add(obj)
         await db.commit()
         await db.refresh(obj)
-        return _to_response(obj)
+        return _to_response(
+            obj,
+            teacher_name=teacher.full_name,
+            class_name=cl.name,
+            section_name=sec.name,
+            subject_name=subj.name,
+        )
     except IntegrityError:
         await db.rollback()
         raise ServiceError("This teacher-subject assignment already exists", status.HTTP_409_CONFLICT)
@@ -88,9 +104,16 @@ async def list_teacher_subject_assignments(
     teacher_id: Optional[UUID] = None,
     class_id: Optional[UUID] = None,
 ) -> List[TeacherSubjectAssignmentResponse]:
-    stmt = select(TeacherSubjectAssignment).where(
-        TeacherSubjectAssignment.tenant_id == tenant_id,
-        TeacherSubjectAssignment.academic_year_id == academic_year_id,
+    stmt = (
+        select(TeacherSubjectAssignment, User, SchoolClass, Section, SchoolSubject)
+        .join(User, TeacherSubjectAssignment.teacher_id == User.id)
+        .join(SchoolClass, TeacherSubjectAssignment.class_id == SchoolClass.id)
+        .join(Section, TeacherSubjectAssignment.section_id == Section.id)
+        .join(SchoolSubject, TeacherSubjectAssignment.subject_id == SchoolSubject.id)
+        .where(
+            TeacherSubjectAssignment.tenant_id == tenant_id,
+            TeacherSubjectAssignment.academic_year_id == academic_year_id,
+        )
     )
     if teacher_id is not None:
         stmt = stmt.where(TeacherSubjectAssignment.teacher_id == teacher_id)
@@ -98,7 +121,17 @@ async def list_teacher_subject_assignments(
         stmt = stmt.where(TeacherSubjectAssignment.class_id == class_id)
     stmt = stmt.order_by(TeacherSubjectAssignment.teacher_id, TeacherSubjectAssignment.class_id)
     result = await db.execute(stmt)
-    return [_to_response(t) for t in result.scalars().all()]
+    rows = result.all()
+    return [
+        _to_response(
+            t,
+            teacher_name=teacher.full_name,
+            class_name=cl.name,
+            section_name=sec.name,
+            subject_name=subj.name,
+        )
+        for t, teacher, cl, sec, subj in rows
+    ]
 
 
 async def teacher_can_override_for_subject(

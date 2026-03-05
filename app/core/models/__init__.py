@@ -37,6 +37,11 @@ from app.core.models.audit_log import AuditLog
 from app.core.models.leave_type import LeaveType
 from app.core.models.leave_request import LeaveRequest
 from app.core.models.leave_audit_log import LeaveAuditLog
+from app.core.models.asset_type import AssetType
+from app.core.models.asset import Asset
+from app.core.models.asset_assignment import AssetAssignment
+from app.core.models.asset_maintenance import AssetMaintenance
+from app.core.models.asset_audit_log import AssetAuditLog
 from app.core.models.fee_component import FeeComponent
 from app.core.models.class_fee_structure import ClassFeeStructure
 from app.core.models.student_fee_assignment import StudentFeeAssignment
@@ -91,6 +96,11 @@ __all__ = [
     "LeaveType",
     "LeaveRequest",
     "LeaveAuditLog",
+    "AssetType",
+    "Asset",
+    "AssetAssignment",
+    "AssetMaintenance",
+    "AssetAuditLog",
     "FeeComponent",
     "ClassFeeStructure",
     "StudentFeeAssignment",

@@ -28,7 +28,12 @@ from .schemas import (
 )
 
 
-def _to_response(a: ClassTeacherAssignment) -> ClassTeacherAssignmentResponse:
+def _to_response(
+    a: ClassTeacherAssignment,
+    class_name: Optional[str] = None,
+    section_name: Optional[str] = None,
+    teacher_name: Optional[str] = None,
+) -> ClassTeacherAssignmentResponse:
     return ClassTeacherAssignmentResponse(
         id=a.id,
         tenant_id=a.tenant_id,
@@ -37,6 +42,9 @@ def _to_response(a: ClassTeacherAssignment) -> ClassTeacherAssignmentResponse:
         section_id=a.section_id,
         teacher_id=a.teacher_id,
         created_at=a.created_at,
+        class_name=class_name,
+        section_name=section_name,
+        teacher_name=teacher_name,
     )
 
 
@@ -87,7 +95,7 @@ async def create_class_teacher_assignment(
         db.add(obj)
         await db.commit()
         await db.refresh(obj)
-        return _to_response(obj)
+        return _to_response(obj, class_name=cl.name, section_name=sec.name, teacher_name=teacher.full_name)
     except IntegrityError:
         await db.rollback()
         raise ServiceError(
@@ -106,7 +114,13 @@ async def list_class_teacher_assignments(
     teacher_only_see_own: bool = False,
     current_user_id: Optional[UUID] = None,
 ) -> List[ClassTeacherAssignmentResponse]:
-    stmt = select(ClassTeacherAssignment).where(ClassTeacherAssignment.tenant_id == tenant_id)
+    stmt = (
+        select(ClassTeacherAssignment, SchoolClass, Section, User)
+        .join(SchoolClass, ClassTeacherAssignment.class_id == SchoolClass.id)
+        .join(Section, ClassTeacherAssignment.section_id == Section.id)
+        .join(User, ClassTeacherAssignment.teacher_id == User.id)
+        .where(ClassTeacherAssignment.tenant_id == tenant_id)
+    )
     if academic_year_id is not None:
         stmt = stmt.where(ClassTeacherAssignment.academic_year_id == academic_year_id)
     if teacher_id is not None:
@@ -117,9 +131,17 @@ async def list_class_teacher_assignments(
         stmt = stmt.where(ClassTeacherAssignment.section_id == section_id)
     if teacher_only_see_own and current_user_id is not None:
         stmt = stmt.where(ClassTeacherAssignment.teacher_id == current_user_id)
-    stmt = stmt.order_by(ClassTeacherAssignment.academic_year_id, ClassTeacherAssignment.class_id, ClassTeacherAssignment.section_id)
+    stmt = stmt.order_by(
+        ClassTeacherAssignment.academic_year_id,
+        ClassTeacherAssignment.class_id,
+        ClassTeacherAssignment.section_id,
+    )
     result = await db.execute(stmt)
-    return [_to_response(a) for a in result.scalars().all()]
+    rows = result.all()
+    return [
+        _to_response(a, class_name=cl.name, section_name=sec.name, teacher_name=teacher.full_name)
+        for a, cl, sec, teacher in rows
+    ]
 
 
 async def get_class_teacher_assignment(
@@ -130,17 +152,22 @@ async def get_class_teacher_assignment(
     current_user_id: Optional[UUID] = None,
 ) -> Optional[ClassTeacherAssignmentResponse]:
     result = await db.execute(
-        select(ClassTeacherAssignment).where(
+        select(ClassTeacherAssignment, SchoolClass, Section, User)
+        .join(SchoolClass, ClassTeacherAssignment.class_id == SchoolClass.id)
+        .join(Section, ClassTeacherAssignment.section_id == Section.id)
+        .join(User, ClassTeacherAssignment.teacher_id == User.id)
+        .where(
             ClassTeacherAssignment.id == assignment_id,
             ClassTeacherAssignment.tenant_id == tenant_id,
         )
     )
-    obj = result.scalar_one_or_none()
-    if not obj:
+    row = result.one_or_none()
+    if not row:
         return None
+    obj, cl, sec, teacher = row
     if teacher_only_see_own and current_user_id is not None and obj.teacher_id != current_user_id:
         return None
-    return _to_response(obj)
+    return _to_response(obj, class_name=cl.name, section_name=sec.name, teacher_name=teacher.full_name)
 
 
 async def update_class_teacher_assignment(
@@ -168,7 +195,15 @@ async def update_class_teacher_assignment(
     obj.teacher_id = payload.teacher_id
     await db.commit()
     await db.refresh(obj)
-    return _to_response(obj)
+    cl = await db.get(SchoolClass, obj.class_id)
+    sec = await db.get(Section, obj.section_id)
+    teacher = await db.get(User, obj.teacher_id)
+    return _to_response(
+        obj,
+        class_name=cl.name if cl else None,
+        section_name=sec.name if sec else None,
+        teacher_name=teacher.full_name if teacher else None,
+    )
 
 
 async def delete_class_teacher_assignment(

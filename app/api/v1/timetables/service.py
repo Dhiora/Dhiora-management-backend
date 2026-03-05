@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth.models import User
 from app.core.exceptions import ServiceError
 from app.core.models import AcademicYear, SchoolClass, SchoolSubject, Section, TimeSlot, Timetable
 
@@ -14,7 +15,14 @@ from app.api.v1.class_subjects import service as class_subjects_service
 from .schemas import TimeSlotInfo, TimetableSlotCreate, TimetableSlotResponse, TimetableSlotUpdate
 
 
-def _to_response(t: Timetable, slot: Optional[TimeSlot] = None) -> TimetableSlotResponse:
+def _to_response(
+    t: Timetable,
+    slot: Optional[TimeSlot] = None,
+    class_name: Optional[str] = None,
+    section_name: Optional[str] = None,
+    subject_name: Optional[str] = None,
+    teacher_name: Optional[str] = None,
+) -> TimetableSlotResponse:
     if slot is None:
         slot = getattr(t, "time_slot", None)
     slot_info = TimeSlotInfo(
@@ -35,6 +43,10 @@ def _to_response(t: Timetable, slot: Optional[TimeSlot] = None) -> TimetableSlot
         day_of_week=t.day_of_week,
         slot=slot_info,
         created_at=t.created_at,
+        class_name=class_name,
+        section_name=section_name,
+        subject_name=subject_name,
+        teacher_name=teacher_name,
     )
 
 
@@ -99,6 +111,7 @@ async def create_timetable_slot(
             "Teacher already has a class in this slot for this day",
             status.HTTP_409_CONFLICT,
         )
+    teacher = await db.get(User, payload.teacher_id)
     try:
         obj = Timetable(
             tenant_id=tenant_id,
@@ -113,7 +126,14 @@ async def create_timetable_slot(
         db.add(obj)
         await db.commit()
         await db.refresh(obj)
-        return _to_response(obj)
+        return _to_response(
+            obj,
+            time_slot,
+            class_name=cl.name,
+            section_name=sec.name,
+            subject_name=subj.name,
+            teacher_name=teacher.full_name if teacher else None,
+        )
     except IntegrityError:
         await db.rollback()
         raise ServiceError("Timetable slot creation failed", status.HTTP_409_CONFLICT)
@@ -126,11 +146,17 @@ async def list_timetable_slots(
     class_id: Optional[UUID] = None,
     section_id: Optional[UUID] = None,
 ) -> List[TimetableSlotResponse]:
-    stmt = select(Timetable, TimeSlot).join(
-        TimeSlot, Timetable.slot_id == TimeSlot.id
-    ).where(
-        Timetable.tenant_id == tenant_id,
-        Timetable.academic_year_id == academic_year_id,
+    stmt = (
+        select(Timetable, TimeSlot, SchoolClass, Section, SchoolSubject, User)
+        .join(TimeSlot, Timetable.slot_id == TimeSlot.id)
+        .join(SchoolClass, Timetable.class_id == SchoolClass.id)
+        .join(Section, Timetable.section_id == Section.id)
+        .join(SchoolSubject, Timetable.subject_id == SchoolSubject.id)
+        .join(User, Timetable.teacher_id == User.id)
+        .where(
+            Timetable.tenant_id == tenant_id,
+            Timetable.academic_year_id == academic_year_id,
+        )
     )
     if class_id is not None:
         stmt = stmt.where(Timetable.class_id == class_id)
@@ -139,7 +165,17 @@ async def list_timetable_slots(
     stmt = stmt.order_by(Timetable.day_of_week, TimeSlot.order_index)
     result = await db.execute(stmt)
     rows = result.all()
-    return [_to_response(t, slot) for t, slot in rows]
+    return [
+        _to_response(
+            t,
+            slot,
+            class_name=cl.name,
+            section_name=sec.name,
+            subject_name=subj.name,
+            teacher_name=teacher.full_name if teacher else None,
+        )
+        for t, slot, cl, sec, subj, teacher in rows
+    ]
 
 
 async def get_timetable_slot(
@@ -148,7 +184,13 @@ async def get_timetable_slot(
     slot_id: UUID,
 ) -> Optional[TimetableSlotResponse]:
     result = await db.execute(
-        select(Timetable, TimeSlot).join(TimeSlot, Timetable.slot_id == TimeSlot.id).where(
+        select(Timetable, TimeSlot, SchoolClass, Section, SchoolSubject, User)
+        .join(TimeSlot, Timetable.slot_id == TimeSlot.id)
+        .join(SchoolClass, Timetable.class_id == SchoolClass.id)
+        .join(Section, Timetable.section_id == Section.id)
+        .join(SchoolSubject, Timetable.subject_id == SchoolSubject.id)
+        .join(User, Timetable.teacher_id == User.id)
+        .where(
             Timetable.id == slot_id,
             Timetable.tenant_id == tenant_id,
         )
@@ -156,8 +198,15 @@ async def get_timetable_slot(
     row = result.one_or_none()
     if not row:
         return None
-    t, slot = row
-    return _to_response(t, slot)
+    t, slot, cl, sec, subj, teacher = row
+    return _to_response(
+        t,
+        slot,
+        class_name=cl.name,
+        section_name=sec.name,
+        subject_name=subj.name,
+        teacher_name=teacher.full_name if teacher else None,
+    )
 
 
 async def update_timetable_slot(
@@ -184,9 +233,20 @@ async def update_timetable_slot(
         obj.slot_id = payload.slot_id
     await db.commit()
     await db.refresh(obj)
-    # load slot for response
+    # load slot, class, section, subject, teacher for response
     slot = await db.get(TimeSlot, obj.slot_id)
-    return _to_response(obj, slot)
+    cl = await db.get(SchoolClass, obj.class_id)
+    sec = await db.get(Section, obj.section_id)
+    subj = await db.get(SchoolSubject, obj.subject_id)
+    teacher = await db.get(User, obj.teacher_id)
+    return _to_response(
+        obj,
+        slot,
+        class_name=cl.name if cl else None,
+        section_name=sec.name if sec else None,
+        subject_name=subj.name if subj else None,
+        teacher_name=teacher.full_name if teacher else None,
+    )
 
 
 async def delete_timetable_slot(

@@ -44,6 +44,7 @@ CREATE_SCHEMA_SQL: Dict[str, str] = {
     "school": "CREATE SCHEMA IF NOT EXISTS school;",
     "hrms": "CREATE SCHEMA IF NOT EXISTS hrms;",
     "leave": "CREATE SCHEMA IF NOT EXISTS leave;",
+    "asset": "CREATE SCHEMA IF NOT EXISTS asset;",
 }
 
 
@@ -1061,6 +1062,11 @@ LEAVE_TYPES_TABLE: str = """
         name VARCHAR(100) NOT NULL,
         code VARCHAR(50) NOT NULL,
         is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        is_paid BOOLEAN NOT NULL DEFAULT TRUE,
+        max_per_month INTEGER,
+        max_per_year INTEGER,
+        allow_half_day BOOLEAN NOT NULL DEFAULT FALSE,
+        requires_approval BOOLEAN NOT NULL DEFAULT TRUE,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         CONSTRAINT uq_leave_type_tenant_code UNIQUE (tenant_id, code)
     );
@@ -1078,6 +1084,8 @@ LEAVE_REQUESTS_TABLE: str = """
         from_date DATE NOT NULL,
         to_date DATE NOT NULL,
         total_days INTEGER NOT NULL,
+        is_paid BOOLEAN NOT NULL DEFAULT TRUE,
+        leave_duration_type VARCHAR(20) NOT NULL DEFAULT 'FULL_DAY',
         status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
         assigned_to_user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE RESTRICT,
         approved_by_user_id UUID REFERENCES auth.users(id) ON DELETE SET NULL,
@@ -1096,6 +1104,94 @@ LEAVE_AUDIT_LOGS_TABLE: str = """
     CREATE TABLE IF NOT EXISTS leave.leave_audit_logs (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         leave_request_id UUID NOT NULL REFERENCES leave.leave_requests(id) ON DELETE CASCADE,
+        action VARCHAR(50) NOT NULL,
+        performed_by UUID NOT NULL REFERENCES auth.users(id) ON DELETE SET NULL,
+        performed_by_role VARCHAR(50),
+        remarks TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+"""
+
+# ----- Global Asset Management -----
+ASSET_TYPES_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS asset.asset_types (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        name VARCHAR(100) NOT NULL,
+        code VARCHAR(50) NOT NULL,
+        description TEXT,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_asset_type_tenant_code UNIQUE (tenant_id, code)
+    );
+"""
+
+ASSETS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS asset.assets (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        asset_type_id UUID NOT NULL REFERENCES asset.asset_types(id) ON DELETE RESTRICT,
+        asset_name VARCHAR(255) NOT NULL,
+        asset_code VARCHAR(100) NOT NULL,
+        serial_number VARCHAR(255),
+        purchase_date DATE,
+        purchase_cost NUMERIC(12,2),
+        warranty_expiry DATE,
+        status VARCHAR(30) NOT NULL,
+        location VARCHAR(255),
+        created_by UUID NOT NULL REFERENCES auth.users(id) ON DELETE RESTRICT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT chk_asset_status CHECK (status IN ('AVAILABLE','ASSIGNED','UNDER_MAINTENANCE','DAMAGED','LOST','RETIRED')),
+        CONSTRAINT uq_asset_tenant_code UNIQUE (tenant_id, asset_code)
+    );
+"""
+
+ASSET_ASSIGNMENTS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS asset.asset_assignments (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        asset_id UUID NOT NULL REFERENCES asset.assets(id) ON DELETE RESTRICT,
+        asset_user_type VARCHAR(20) NOT NULL,
+        employee_id UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+        student_id UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+        assigned_by UUID NOT NULL REFERENCES auth.users(id) ON DELETE RESTRICT,
+        assigned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        expected_return_date DATE,
+        returned_at TIMESTAMPTZ,
+        return_condition TEXT,
+        status VARCHAR(20) NOT NULL,
+        CONSTRAINT chk_asset_assignment_user CHECK (
+            (asset_user_type = 'EMPLOYEE' AND employee_id IS NOT NULL AND student_id IS NULL) OR
+            (asset_user_type = 'STUDENT' AND student_id IS NOT NULL AND employee_id IS NULL)
+        ),
+        CONSTRAINT chk_asset_assignment_status CHECK (status IN ('ASSIGNED','RETURNED','OVERDUE'))
+    );
+"""
+
+ASSET_MAINTENANCE_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS asset.asset_maintenance (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        asset_id UUID NOT NULL REFERENCES asset.assets(id) ON DELETE RESTRICT,
+        reported_issue TEXT NOT NULL,
+        maintenance_type VARCHAR(20) NOT NULL,
+        reported_by UUID NOT NULL REFERENCES auth.users(id) ON DELETE RESTRICT,
+        assigned_technician UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+        maintenance_status VARCHAR(20) NOT NULL,
+        cost NUMERIC(12,2),
+        started_at TIMESTAMPTZ,
+        completed_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT chk_asset_maintenance_type CHECK (maintenance_type IN ('REPAIR','SERVICE')),
+        CONSTRAINT chk_asset_maintenance_status CHECK (maintenance_status IN ('OPEN','IN_PROGRESS','COMPLETED'))
+    );
+"""
+
+ASSET_AUDIT_LOGS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS asset.asset_audit_logs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        asset_id UUID NOT NULL REFERENCES asset.assets(id) ON DELETE CASCADE,
         action VARCHAR(50) NOT NULL,
         performed_by UUID NOT NULL REFERENCES auth.users(id) ON DELETE SET NULL,
         performed_by_role VARCHAR(50),
@@ -1268,6 +1364,38 @@ ALTER_STUDENT_FEE_ASSIGNMENTS_UPGRADE: str = """
             END IF;
         END IF;
     EXCEPTION WHEN others THEN NULL;
+    END $$;
+"""
+
+# ----- Leave Management Upgrades -----
+ALTER_LEAVE_TYPES_POLICY_COLUMNS: str = """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'leave' AND table_name = 'leave_types' AND column_name = 'is_paid'
+        ) THEN
+            ALTER TABLE leave.leave_types
+                ADD COLUMN is_paid BOOLEAN NOT NULL DEFAULT TRUE,
+                ADD COLUMN max_per_month INTEGER,
+                ADD COLUMN max_per_year INTEGER,
+                ADD COLUMN allow_half_day BOOLEAN NOT NULL DEFAULT FALSE,
+                ADD COLUMN requires_approval BOOLEAN NOT NULL DEFAULT TRUE;
+        END IF;
+    END $$;
+"""
+
+ALTER_LEAVE_REQUESTS_POLICY_COLUMNS: str = """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'leave' AND table_name = 'leave_requests' AND column_name = 'is_paid'
+        ) THEN
+            ALTER TABLE leave.leave_requests
+                ADD COLUMN is_paid BOOLEAN NOT NULL DEFAULT TRUE,
+                ADD COLUMN leave_duration_type VARCHAR(20) NOT NULL DEFAULT 'FULL_DAY';
+        END IF;
     END $$;
 """
 
@@ -1541,8 +1669,24 @@ async def ensure_tables(db_engine: AsyncEngine) -> None:
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_leave_requests_status ON leave.leave_requests(status)"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_leave_requests_assigned_to ON leave.leave_requests(assigned_to_user_id)"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_leave_requests_created_by ON leave.leave_requests(created_by)"))
+        await conn.execute(text(ALTER_LEAVE_TYPES_POLICY_COLUMNS))
+        await conn.execute(text(ALTER_LEAVE_REQUESTS_POLICY_COLUMNS))
         await conn.execute(text(LEAVE_AUDIT_LOGS_TABLE))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_leave_audit_logs_request_id ON leave.leave_audit_logs(leave_request_id)"))
+        await conn.execute(text(ASSET_TYPES_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_asset_types_tenant_id ON asset.asset_types(tenant_id)"))
+        await conn.execute(text(ASSETS_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_assets_tenant_id ON asset.assets(tenant_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_assets_type_id ON asset.assets(asset_type_id)"))
+        await conn.execute(text(ASSET_ASSIGNMENTS_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_asset_assignments_tenant_id ON asset.asset_assignments(tenant_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_asset_assignments_asset_id ON asset.asset_assignments(asset_id)"))
+        await conn.execute(text(ASSET_MAINTENANCE_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_asset_maintenance_tenant_id ON asset.asset_maintenance(tenant_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_asset_maintenance_asset_id ON asset.asset_maintenance(asset_id)"))
+        await conn.execute(text(ASSET_AUDIT_LOGS_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_asset_audit_logs_tenant_id ON asset.asset_audit_logs(tenant_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_asset_audit_logs_asset_id ON asset.asset_audit_logs(asset_id)"))
         await conn.execute(text(HOMEWORKS_TABLE))
         await conn.execute(text(HOMEWORK_QUESTIONS_TABLE))
         await conn.execute(text(ALTER_HOMEWORK_QUESTIONS_QUESTION_TYPES))

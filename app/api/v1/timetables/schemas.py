@@ -39,6 +39,10 @@ class TimetableSlotResponse(BaseModel):
     day_of_week: int
     slot: TimeSlotInfo
     created_at: datetime
+    class_name: Optional[str] = None
+    section_name: Optional[str] = None
+    subject_name: Optional[str] = None
+    teacher_name: Optional[str] = None
 
     class Config:
         from_attributes = True

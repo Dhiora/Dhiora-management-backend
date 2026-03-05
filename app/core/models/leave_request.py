@@ -3,7 +3,7 @@
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import Column, Date, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, Column, Date, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
@@ -38,6 +38,8 @@ class LeaveRequest(Base):
     from_date = Column(Date, nullable=False)
     to_date = Column(Date, nullable=False)
     total_days = Column(Integer, nullable=False)
+    is_paid = Column(Boolean, nullable=False, default=True)
+    leave_duration_type = Column(String(20), nullable=False, default="FULL_DAY")
     status = Column(String(20), nullable=False, default=LEAVE_STATUS_PENDING)
     assigned_to_user_id = Column(UUID(as_uuid=True), ForeignKey("auth.users.id", ondelete="RESTRICT"), nullable=False, index=True)
     approved_by_user_id = Column(UUID(as_uuid=True), ForeignKey("auth.users.id", ondelete="SET NULL"), nullable=True)

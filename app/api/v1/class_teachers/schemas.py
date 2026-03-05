@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Optional
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -23,6 +24,9 @@ class ClassTeacherAssignmentResponse(BaseModel):
     section_id: UUID
     teacher_id: UUID
     created_at: datetime
+    class_name: Optional[str] = None
+    section_name: Optional[str] = None
+    teacher_name: Optional[str] = None
 
     class Config:
         from_attributes = True

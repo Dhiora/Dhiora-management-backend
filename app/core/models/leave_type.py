@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, Column, DateTime, ForeignKey, String, UniqueConstraint
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
@@ -22,6 +22,11 @@ class LeaveType(Base):
     name = Column(String(100), nullable=False)
     code = Column(String(50), nullable=False)
     is_active = Column(Boolean, nullable=False, default=True)
+    is_paid = Column(Boolean, nullable=False, default=True)
+    max_per_month = Column(Integer, nullable=True)
+    max_per_year = Column(Integer, nullable=True)
+    allow_half_day = Column(Boolean, nullable=False, default=False)
+    requires_approval = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
 
     tenant = relationship("Tenant", backref="leave_types", foreign_keys=[tenant_id])

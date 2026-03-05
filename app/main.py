@@ -18,6 +18,7 @@ from app.api.v1.modules.users.student_router import router as students_router
 from app.api.v1.query.query_router import router as query_router
 from app.api.v1.dropdown.dropdown_router import router as dropdown_router
 from app.api.v1.leaves.router import router as leaves_router
+from app.api.v1.assets.router import router as assets_router
 from app.api.v1.subjects.router import router as subjects_router
 from app.api.v1.class_subjects.router import router as class_subjects_router
 from app.api.v1.timetables.router import router as timetables_router
@@ -61,6 +62,7 @@ def create_app() -> FastAPI:
     app.include_router(query_router)
     app.include_router(dropdown_router)
     app.include_router(leaves_router)
+    app.include_router(assets_router)
     app.include_router(subjects_router)
     app.include_router(class_subjects_router)
     app.include_router(timetables_router)
