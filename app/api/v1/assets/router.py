@@ -115,6 +115,29 @@ async def list_assets(
     return await service.list_assets(db, current_user.tenant_id)
 
 
+@router.post(
+    "",
+    response_model=AssetResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(check_permission("asset", "manage_assets"))],
+)
+async def create_asset(
+    payload: AssetCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+) -> AssetResponse:
+    try:
+        return await service.create_asset(
+            db,
+            current_user.tenant_id,
+            current_user.id,
+            payload,
+            current_user.role,
+        )
+    except ServiceError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+
+
 # ----- Assignments -----
 @router.post(
     "/assign",

@@ -816,6 +816,48 @@ CLASS_TEACHER_ASSIGNMENTS_TABLE: str = """
     );
 """
 
+# ----- Exam Management -----
+EXAM_TYPES_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.exam_types (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        name VARCHAR(100) NOT NULL,
+        description TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+"""
+EXAMS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.exams (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        exam_type_id UUID NOT NULL REFERENCES school.exam_types(id) ON DELETE RESTRICT,
+        name VARCHAR(255) NOT NULL,
+        class_id UUID NOT NULL REFERENCES core.classes(id) ON DELETE CASCADE,
+        section_id UUID NOT NULL REFERENCES core.sections(id) ON DELETE CASCADE,
+        start_date DATE NOT NULL,
+        end_date DATE NOT NULL,
+        status VARCHAR(20) NOT NULL DEFAULT 'draft',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT chk_exam_status CHECK (status IN ('draft', 'scheduled', 'completed'))
+    );
+"""
+EXAM_SCHEDULE_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.exam_schedule (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        exam_id UUID NOT NULL REFERENCES school.exams(id) ON DELETE CASCADE,
+        subject_id UUID NOT NULL REFERENCES school.subjects(id) ON DELETE RESTRICT,
+        class_id UUID NOT NULL REFERENCES core.classes(id) ON DELETE CASCADE,
+        section_id UUID NOT NULL REFERENCES core.sections(id) ON DELETE CASCADE,
+        exam_date DATE NOT NULL,
+        start_time TIME NOT NULL,
+        end_time TIME NOT NULL,
+        room_number VARCHAR(50),
+        invigilator_teacher_id UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+"""
+
 # Overrides: ensure FK to school.subjects. For existing DBs that had FK to core.subjects, drop and re-add.
 ALTER_OVERRIDES_FK_TO_SCHOOL_SUBJECTS: str = """
     DO $$
@@ -1537,6 +1579,25 @@ TRANSPORT_ASSIGNMENTS_TABLE: str = """
     );
 """
 
+HOLIDAY_CALENDAR_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.holiday_calendar (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        academic_year_id UUID NOT NULL REFERENCES core.academic_years(id) ON DELETE RESTRICT,
+        holiday_name VARCHAR(255) NOT NULL,
+        holiday_date DATE NOT NULL,
+        month INTEGER NOT NULL,
+        year INTEGER NOT NULL,
+        description TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        created_by UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+        updated_by UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+        CONSTRAINT uq_holiday_calendar_tenant_ay_date UNIQUE (tenant_id, academic_year_id, holiday_date),
+        CONSTRAINT chk_holiday_calendar_month CHECK (month >= 1 AND month <= 12)
+    );
+"""
+
 # Drop class_id, section_id from student_profiles (after backfill)
 ALTER_STUDENT_PROFILES_DROP_CLASS_SECTION: str = """
     DO $$
@@ -1654,6 +1715,14 @@ async def ensure_tables(db_engine: AsyncEngine) -> None:
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_class_teacher_assignments_tenant ON school.class_teacher_assignments(tenant_id)"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_class_teacher_assignments_ay ON school.class_teacher_assignments(academic_year_id)"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_class_teacher_assignments_teacher ON school.class_teacher_assignments(teacher_id)"))
+        await conn.execute(text(EXAM_TYPES_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_exam_types_tenant_id ON school.exam_types(tenant_id)"))
+        await conn.execute(text(EXAMS_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_exams_tenant_id ON school.exams(tenant_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_exams_exam_type_id ON school.exams(exam_type_id)"))
+        await conn.execute(text(EXAM_SCHEDULE_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_exam_schedule_tenant_id ON school.exam_schedule(tenant_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_exam_schedule_exam_id ON school.exam_schedule(exam_id)"))
         await conn.execute(text(STUDENT_ATTENDANCE_TABLE))
         await conn.execute(text(STUDENT_DAILY_ATTENDANCE_TABLE))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_student_daily_attendance_tenant_date ON school.student_daily_attendance(tenant_id, attendance_date)"))
@@ -1735,6 +1804,8 @@ async def ensure_tables(db_engine: AsyncEngine) -> None:
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_transport_assignments_person ON school.transport_assignments(person_id)"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_transport_assignments_route ON school.transport_assignments(route_id)"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_transport_assignments_vehicle ON school.transport_assignments(vehicle_id)"))
+        await conn.execute(text(HOLIDAY_CALENDAR_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_holiday_calendar_tenant_ay_month ON school.holiday_calendar(tenant_id, academic_year_id, month)"))
 
     # Backfill student_academic_records from existing student_profiles (class_id, section_id)
     # Idempotent: only inserts if no record exists for (student_id, current_academic_year_id)

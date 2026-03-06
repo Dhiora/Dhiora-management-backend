@@ -25,11 +25,14 @@ from app.api.v1.timetables.router import router as timetables_router
 from app.api.v1.time_slots.router import router as time_slots_router
 from app.api.v1.teacher_subject_assignments.router import router as teacher_subject_assignments_router
 from app.api.v1.class_teachers.router import router as class_teachers_router
+from app.api.v1.schedule.class_schedule_router import router as schedule_router
+from app.api.v1.exam.router import router as exam_router
 from app.api.v1.fee_components.router import router as fee_components_router
 from app.api.v1.fees.router import router as fees_router
 from app.api.v1.transport.router import router as transport_router
 from app.api.v1.ai_classroom.router import router as ai_classroom_router
 from app.api.v1.ws.router import router as ws_router
+from app.api.v1.holiday_calendar.router import router as holiday_calendar_router
 
 
 def create_app() -> FastAPI:
@@ -52,6 +55,7 @@ def create_app() -> FastAPI:
     app.include_router(attendance_router)
     app.include_router(homework_router)
     app.include_router(departments_router)
+    app.include_router(schedule_router)  # before classes so /{class_id}/sections/{section_id}/schedule matches
     app.include_router(classes_router)
     app.include_router(sections_router)
     app.include_router(modules_router)
@@ -69,11 +73,13 @@ def create_app() -> FastAPI:
     app.include_router(time_slots_router)
     app.include_router(teacher_subject_assignments_router)
     app.include_router(class_teachers_router)
+    app.include_router(exam_router)
     app.include_router(fee_components_router)
     app.include_router(fees_router)
     app.include_router(transport_router)
     app.include_router(ai_classroom_router)
     app.include_router(ws_router)
+    app.include_router(holiday_calendar_router)
 
     return app
 

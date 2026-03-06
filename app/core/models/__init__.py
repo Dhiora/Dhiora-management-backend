@@ -57,6 +57,10 @@ from app.core.models.ai_lecture_session import AILectureSession
 from app.core.models.ai_lecture_chunk import AILectureChunk
 from app.core.models.ai_doubt_chat import AIDoubtChat
 from app.core.models.ai_doubt_message import AIDoubtMessage
+from app.core.models.exam_type import ExamType
+from app.core.models.exam import Exam
+from app.core.models.exam_schedule import ExamSchedule
+from app.core.models.holiday_calendar import HolidayCalendar
 
 __all__ = [
     "AcademicYear",
@@ -116,5 +120,9 @@ __all__ = [
     "AILectureChunk",
     "AIDoubtChat",
     "AIDoubtMessage",
+    "ExamType",
+    "Exam",
+    "ExamSchedule",
+    "HolidayCalendar",
 ]
 
