@@ -79,6 +79,7 @@ async def get_current_user(
         id=user.id,
         tenant_id=user.tenant_id,
         role=user.role,
+        user_type=getattr(user, "user_type", None),
         permissions=permissions or {},
         academic_year_id=academic_year_id,
         academic_year_status=academic_year_status,

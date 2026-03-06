@@ -110,11 +110,13 @@ class RoleResponse(BaseModel):
 class CurrentUser(BaseModel):
     """Lightweight representation of the authenticated user for RBAC checks.
     academic_year_id and academic_year_status come from the ACTIVE academic year at login.
+    user_type: employee | student | None (for admin users).
     """
 
     id: UUID
     tenant_id: UUID
     role: str
+    user_type: Optional[str] = None  # employee | student; None for admin users
     permissions: Dict[str, Dict[str, bool]]
     academic_year_id: Optional[UUID] = None  # ACTIVE academic year (is_current=true) at login
     academic_year_status: Optional[str] = None  # ACTIVE | CLOSED; CLOSED => read-only
