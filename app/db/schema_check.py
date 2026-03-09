@@ -1096,6 +1096,97 @@ EMPLOYEE_ATTENDANCE_TABLE: str = """
     );
 """
 
+# ----- Payroll (hrms) -----
+PAYROLL_COMPONENTS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS hrms.payroll_components (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        name VARCHAR(100) NOT NULL,
+        code VARCHAR(50) NOT NULL,
+        type VARCHAR(20) NOT NULL,
+        calculation_type VARCHAR(20) NOT NULL,
+        default_value NUMERIC(12, 2),
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_payroll_component_tenant_code UNIQUE (tenant_id, code)
+    );
+"""
+EMPLOYEE_SALARY_COMPONENTS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS hrms.employee_salary_components (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        employee_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+        component_id UUID NOT NULL REFERENCES hrms.payroll_components(id) ON DELETE RESTRICT,
+        amount NUMERIC(12, 2) NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_employee_salary_component UNIQUE (tenant_id, employee_id, component_id)
+    );
+"""
+PAYROLL_RUNS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS hrms.payroll_runs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        month VARCHAR(20) NOT NULL,
+        year VARCHAR(10) NOT NULL,
+        start_date DATE NOT NULL,
+        end_date DATE NOT NULL,
+        status VARCHAR(20) NOT NULL DEFAULT 'draft',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_payroll_run_tenant_month_year UNIQUE (tenant_id, month, year)
+    );
+"""
+PAYROLL_EMPLOYEE_RECORDS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS hrms.payroll_employee_records (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        payroll_run_id UUID NOT NULL REFERENCES hrms.payroll_runs(id) ON DELETE CASCADE,
+        employee_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+        gross_salary NUMERIC(14, 2) NOT NULL,
+        total_deductions NUMERIC(14, 2) NOT NULL DEFAULT 0,
+        net_salary NUMERIC(14, 2) NOT NULL,
+        payment_mode VARCHAR(20) NOT NULL,
+        status VARCHAR(20) NOT NULL DEFAULT 'draft',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_payroll_record_run_employee UNIQUE (payroll_run_id, employee_id)
+    );
+"""
+PAYSLIP_TEMPLATES_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS hrms.payslip_templates (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        name VARCHAR(100) NOT NULL,
+        is_default BOOLEAN NOT NULL DEFAULT FALSE,
+        template_json JSONB NOT NULL DEFAULT '{}',
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+"""
+PAYSLIPS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS hrms.payslips (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        employee_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+        payroll_run_id UUID NOT NULL REFERENCES hrms.payroll_runs(id) ON DELETE CASCADE,
+        template_id UUID REFERENCES hrms.payslip_templates(id) ON DELETE SET NULL,
+        month VARCHAR(20) NOT NULL,
+        year VARCHAR(10) NOT NULL,
+        gross_salary NUMERIC(14, 2) NOT NULL,
+        deductions NUMERIC(14, 2) NOT NULL DEFAULT 0,
+        net_salary NUMERIC(14, 2) NOT NULL,
+        payment_mode VARCHAR(20) NOT NULL,
+        issued_at TIMESTAMPTZ,
+        pdf_url TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_payslip_employee_run UNIQUE (employee_id, payroll_run_id)
+    );
+"""
+
 # ----- Global Leave Management -----
 LEAVE_TYPES_TABLE: str = """
     CREATE TABLE IF NOT EXISTS leave.leave_types (
@@ -1731,6 +1822,21 @@ async def ensure_tables(db_engine: AsyncEngine) -> None:
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_student_subject_overrides_tenant ON school.student_subject_attendance_overrides(tenant_id)"))
         await conn.execute(text(ALTER_OVERRIDES_FK_TO_SCHOOL_SUBJECTS))
         await conn.execute(text(EMPLOYEE_ATTENDANCE_TABLE))
+        await conn.execute(text(PAYROLL_COMPONENTS_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_payroll_components_tenant_id ON hrms.payroll_components(tenant_id)"))
+        await conn.execute(text(EMPLOYEE_SALARY_COMPONENTS_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_employee_salary_components_tenant_id ON hrms.employee_salary_components(tenant_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_employee_salary_components_employee_id ON hrms.employee_salary_components(employee_id)"))
+        await conn.execute(text(PAYROLL_RUNS_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_payroll_runs_tenant_id ON hrms.payroll_runs(tenant_id)"))
+        await conn.execute(text(PAYROLL_EMPLOYEE_RECORDS_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_payroll_employee_records_tenant_id ON hrms.payroll_employee_records(tenant_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_payroll_employee_records_run_id ON hrms.payroll_employee_records(payroll_run_id)"))
+        await conn.execute(text(PAYSLIP_TEMPLATES_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_payslip_templates_tenant_id ON hrms.payslip_templates(tenant_id)"))
+        await conn.execute(text(PAYSLIPS_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_payslips_tenant_id ON hrms.payslips(tenant_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_payslips_payroll_run_id ON hrms.payslips(payroll_run_id)"))
         await conn.execute(text(LEAVE_TYPES_TABLE))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_leave_types_tenant_id ON leave.leave_types(tenant_id)"))
         await conn.execute(text(LEAVE_REQUESTS_TABLE))

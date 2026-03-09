@@ -20,6 +20,7 @@ from .schemas import (
     SectionDropdownItem,
     SubjectDropdownItem,
     TeacherDropdownItem,
+    EmployeeDropdownItem,
     TimeSlotDropdownItem,
 )
 
@@ -38,6 +39,7 @@ async def get_classes_sections_dropdown(
 ) -> Union[
     List[AcademicYearDropdownItem],
     List[TeacherDropdownItem],
+    List[EmployeeDropdownItem],
     List[ClassOnlyDropdownItem],
     List[ClassWithSectionsDropdownItem],
     List[ClassWithSectionsAndSubjectsDropdownItem],
@@ -47,6 +49,7 @@ async def get_classes_sections_dropdown(
     Get dropdown data by indicator.
     - indicator=AY: list of { academicYearId, academicYearName }.
     - indicator=T: list of { teacherId, teacherName } (employees).
+    - indicator=EMP: list of { label: employee name, value: employee id } (all employees).
     - indicator=C: list of { className, classId } (no sections key).
     - indicator=CS: list of { className, classId, sections: [...] } (sections for given academic year).
     - indicator=CSS: list of { className, classId, sections: [...], subjects: [...] } for given academic year.
@@ -70,6 +73,16 @@ async def get_classes_sections_dropdown(
             TeacherDropdownItem(
                 teacherId=_to_uuid(emp.id),
                 teacherName=emp.full_name or "",
+            )
+            for emp in employees
+        ]
+
+    if indicator == "EMP":
+        employees = await users_service.list_employees(db, tenant_id)
+        return [
+            EmployeeDropdownItem(
+                label=emp.full_name or "",
+                value=_to_uuid(emp.id),
             )
             for emp in employees
         ]

@@ -15,6 +15,7 @@ from .schemas import (
     ClassWithSectionsDropdownItem,
     ClassWithSectionsAndSubjectsDropdownItem,
     TeacherDropdownItem,
+    EmployeeDropdownItem,
     TimeSlotDropdownItem,
 )
 from . import service
@@ -26,18 +27,17 @@ async def get_dropdown_indicator_and_check_permission(
     indicator: str = Query(
         ...,
         description=(
-            "AY = academic years; T = teachers (employees); "
+            "AY = academic years; T = teachers (employees); EMP = employees (label=name, value=id); "
             "C = classes only; CS = classes with sections nested; "
             "CSS = classes with sections and subjects nested; "
             "TS = time slots (start-end)"
-            
         ),
         min_length=1,
         max_length=5,
     ),
     current_user: CurrentUser = Depends(get_current_user),
 ) -> str:
-    """Validate indicator and enforce permission: AY=academic_years read, T=employees read, C/CS=classes read."""
+    """Validate indicator and enforce permission: AY=academic_years read, T/EMP=employees read, C/CS=classes read."""
     if current_user.role in ("SUPER_ADMIN", "PLATFORM_ADMIN"):
         return indicator
     ind = (indicator or "").strip().upper()
@@ -45,7 +45,7 @@ async def get_dropdown_indicator_and_check_permission(
         perms = (current_user.permissions or {}).get("academic_years") or {}
         if not perms.get("read", False):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
-    elif ind == "T":
+    elif ind in ("T", "EMP"):
         perms = (current_user.permissions or {}).get("employees") or {}
         if not perms.get("read", False):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
@@ -66,6 +66,7 @@ async def get_dropdown_indicator_and_check_permission(
         Union[
             AcademicYearDropdownItem,
             TeacherDropdownItem,
+            EmployeeDropdownItem,
             ClassOnlyDropdownItem,
             ClassWithSectionsDropdownItem,
             ClassWithSectionsAndSubjectsDropdownItem,
@@ -82,6 +83,7 @@ async def get_classes_sections_dropdown(
     Global dropdown by indicator.
     - **indicator=AY**: Returns [{ academicYearId, academicYearName }, ...].
     - **indicator=T**: Returns [{ teacherId, teacherName }, ...] (employees).
+    - **indicator=EMP**: Returns [{ label: employee name, value: employee id }, ...] (all employees).
     - **indicator=C**: Returns [{ className, classId }, ...] (no sections key).
     - **indicator=CS**: Returns [{ className, classId, sections: [{ sectionName, sectionId }, ...] }, ...].
     - **indicator=CSS**: Returns [{ className, classId, sections: [...], subjects: [{ subjectName, subjectId }, ...] }, ...].
