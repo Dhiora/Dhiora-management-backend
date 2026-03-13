@@ -35,6 +35,7 @@ REQUIRED_TABLES: List[Tuple[str, str]] = [
     ("school", "transport_vehicles"),
     ("school", "transport_subscription_plans"),
     ("school", "transport_assignments"),
+    ("school", "management_knowledge_chunks"),
 ]
 
 
@@ -243,6 +244,17 @@ CREATE_TABLE_SQL: Dict[Tuple[str, str], str] = {
             referral_code VARCHAR(20) NOT NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             CONSTRAINT uq_teacher_referral_tenant_code UNIQUE (tenant_id, referral_code)
+        );
+    """,
+    ("school", "management_knowledge_chunks"): """
+        CREATE TABLE IF NOT EXISTS school.management_knowledge_chunks (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+            entity_type VARCHAR(50) NOT NULL,
+            entity_id UUID NULL,
+            content TEXT NOT NULL,
+            embedding VECTOR(1536) NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
     """,
 }
@@ -1732,6 +1744,8 @@ async def ensure_tables(db_engine: AsyncEngine) -> None:
             ("auth", "staff_profiles"),
             ("auth", "student_profiles"),
             ("auth", "teacher_referrals"),
+            # Additional tables that should always exist in bootstrap
+            ("school", "management_knowledge_chunks"),
         ]
         for schema, table in order_tables:
             full_name = f"{schema}.{table}"
@@ -1861,6 +1875,20 @@ async def ensure_tables(db_engine: AsyncEngine) -> None:
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_asset_maintenance_asset_id ON asset.asset_maintenance(asset_id)"))
         await conn.execute(text(ASSET_AUDIT_LOGS_TABLE))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_asset_audit_logs_tenant_id ON asset.asset_audit_logs(tenant_id)"))
+        # Management knowledge chunks (vector store for management chat)
+        await conn.execute(text(CREATE_TABLE_SQL[("school", "management_knowledge_chunks")]))
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS idx_mgmt_chunks_tenant_id "
+                "ON school.management_knowledge_chunks (tenant_id)"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS idx_mgmt_chunks_entity_type "
+                "ON school.management_knowledge_chunks (entity_type)"
+            )
+        )
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_asset_audit_logs_asset_id ON asset.asset_audit_logs(asset_id)"))
         await conn.execute(text(HOMEWORKS_TABLE))
         await conn.execute(text(HOMEWORK_QUESTIONS_TABLE))

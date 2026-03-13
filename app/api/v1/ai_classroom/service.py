@@ -1,9 +1,10 @@
-"""AI Classroom service with transcription, embedding, and RAG."""
+"""AI Classroom service with transcription, embedding, RAG, and management chat."""
 
+import asyncio
 import io
 import logging
 from datetime import datetime, timezone
-from typing import AsyncGenerator, List, Optional, Tuple
+from typing import AsyncGenerator, Iterable, List, Optional, Tuple
 from uuid import UUID
 
 import openai
@@ -13,6 +14,7 @@ from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.models import User
+from app.auth.schemas import CurrentUser
 from app.core.config import settings
 from app.core.exceptions import ServiceError
 from app.core.models import (
@@ -21,6 +23,7 @@ from app.core.models import (
     AILectureChunk,
     AILectureSession,
     AcademicYear,
+    ManagementKnowledgeChunk,
     SchoolClass,
     SchoolSubject,
     Section,
@@ -30,6 +33,7 @@ from .schemas import (
     AdminDoubtRequest,
     DoubtAskRequest,
     LectureCreate,
+    ManagementChatRequest,
     RecordingStartRequest,
     StudentDoubtRequest,
 )
@@ -116,6 +120,230 @@ async def generate_embedding(text: str) -> List[float]:
         raise ServiceError(f"OpenAI API error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
     except Exception as e:
         raise ServiceError(f"Embedding generation error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+# ---------------------------------------------------------------------------
+# Generic management-knowledge indexing helpers (called from CRUD services)
+# ---------------------------------------------------------------------------
+
+
+def _serialize_student_summary(student: "Student") -> str:  # type: ignore[name-defined]
+    """
+    Turn a student ORM instance into a concise natural-language summary.
+    This is an example; extend as needed for your domain.
+    """
+    parts: List[str] = []
+    if getattr(student, "admission_no", None):
+        parts.append(f"Admission No: {student.admission_no}")
+    parts.append(f"Name: {student.first_name} {getattr(student, 'last_name', '')}".strip())
+    if getattr(student, "class_name", None):
+        parts.append(f"Class: {student.class_name}")
+    if getattr(student, "section_name", None):
+        parts.append(f"Section: {student.section_name}")
+    if getattr(student, "parent_phone", None):
+        parts.append(f"Parent Phone: {student.parent_phone}")
+    return ". ".join(parts)
+
+
+async def index_management_entity(
+    db: AsyncSession,
+    tenant_id: UUID,
+    entity_type: str,
+    entity_id: Optional[UUID],
+    content: str,
+) -> ManagementKnowledgeChunk:
+    """
+    Create a vectorized knowledge chunk for any management entity.
+
+    - entity_type: high-level domain label, e.g. STUDENT, EMPLOYEE, FEE, GENERAL
+    - entity_id: optional source primary key
+    - content: natural-language representation to be used in RAG
+    """
+    if not content:
+        raise ServiceError("Cannot index empty content", status.HTTP_400_BAD_REQUEST)
+
+    embedding = await generate_embedding(content)
+    chunk = ManagementKnowledgeChunk(
+        tenant_id=tenant_id,
+        entity_type=entity_type.upper(),
+        entity_id=entity_id,
+        content=content,
+        embedding=embedding,
+    )
+    db.add(chunk)
+    await db.commit()
+    await db.refresh(chunk)
+    return chunk
+
+
+async def bulk_index_management_entities(
+    db: AsyncSession,
+    tenant_id: UUID,
+    entity_type: str,
+    items: Iterable[Tuple[Optional[UUID], str]],
+) -> None:
+    """
+    Helper to index many entities of the same type at once.
+
+    Each item is (entity_id, content).
+    """
+    for entity_id, content in items:
+        await index_management_entity(db, tenant_id, entity_type, entity_id, content)
+
+
+# ---------------------------------------------------------------------------
+# Organization-wide management chat (role-based, vector-backed, SSE)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_allowed_entity_types(current_user: CurrentUser) -> List[str]:
+    """
+    Map CurrentUser.permissions to a list of entity types they can query.
+
+    This is a conservative default; extend mappings as your RBAC evolves.
+    """
+    # Full admins can see all management entities for their tenant
+    if current_user.role in ("SUPER_ADMIN", "PLATFORM_ADMIN", "ADMIN"):
+        return ["STUDENT", "EMPLOYEE", "FEE", "GENERAL"]
+
+    perms = current_user.permissions or {}
+    allowed: List[str] = ["GENERAL"]
+
+    def _has_read(module_key: str) -> bool:
+        module_perms = perms.get(module_key) or {}
+        return bool(module_perms.get("read") or module_perms.get("READ"))
+
+    if _has_read("students") or _has_read("student"):
+        allowed.append("STUDENT")
+    if _has_read("employees") or _has_read("employee"):
+        allowed.append("EMPLOYEE")
+    if _has_read("fees") or _has_read("fee"):
+        allowed.append("FEE")
+
+    return allowed
+
+
+async def management_chat_stream(
+    db: AsyncSession,
+    current_user: CurrentUser,
+    payload: ManagementChatRequest,
+) -> AsyncGenerator[dict, None]:
+    """
+    Single unified chat endpoint for management data.
+
+    - Uses tenant-scoped ManagementKnowledgeChunk pgvector table
+    - Enforces role-based access: if top matches are in an entity_type
+      the user cannot read, respond with access-denied instead of data
+    - Streams answer as SSE-style events: chunk, then done, or a single
+      access-denied message.
+    """
+    tenant_id = current_user.tenant_id
+    question = payload.message.strip()
+    if not question:
+        raise ServiceError("Question cannot be empty", status.HTTP_400_BAD_REQUEST)
+
+    allowed_entity_types = [et.upper() for et in _resolve_allowed_entity_types(current_user)]
+
+    # Embed the question
+    q_embedding = await generate_embedding(question)
+    embedding_str = "[" + ",".join(map(str, q_embedding)) + "]"
+
+    # Pull top N candidate chunks for this tenant
+    stmt = text(
+        """
+        SELECT id, content, entity_type
+        FROM school.management_knowledge_chunks
+        WHERE tenant_id = :tenant_id
+        ORDER BY embedding <-> (:q_embedding)::vector
+        LIMIT 20
+        """
+    )
+    result = await db.execute(
+        stmt,
+        {
+            "tenant_id": str(tenant_id),
+            "q_embedding": embedding_str,
+        },
+    )
+    rows = result.fetchall()
+
+    if not rows:
+        # No knowledge at all; answer generically
+        denial = (
+            "I do not have any management data indexed for your organization yet, "
+            "so I cannot answer this question."
+        )
+        yield {"type": "chunk", "content": denial}
+        yield {"type": "done"}
+        return
+
+    # Separate authorized vs unauthorized chunks
+    authorized_contents: List[str] = []
+    unauthorized_present = False
+    for row in rows:
+        entity_type = str(row[2] or "").upper()
+        if entity_type and entity_type not in allowed_entity_types:
+            unauthorized_present = True
+            continue
+        authorized_contents.append(row[1])
+
+    if not authorized_contents and unauthorized_present:
+        # User is clearly asking about something they don't have rights to see
+        denial = (
+            "Sorry, you do not have access to view this information for your organization. "
+            "Please contact your administrator if you believe this is a mistake."
+        )
+        yield {"type": "chunk", "content": denial}
+        yield {"type": "done"}
+        return
+
+    if not authorized_contents:
+        # Nothing relevant was found
+        no_data = (
+            "I could not find any relevant information in the management data I have access to. "
+            "Try rephrasing your question or check if the data exists."
+        )
+        yield {"type": "chunk", "content": no_data}
+        yield {"type": "done"}
+        return
+
+    context = "\n\n".join(authorized_contents)
+    system_prompt = (
+        "You are an AI assistant for a school management system. "
+        "Use ONLY the provided management data to answer the user's question. "
+        "If specific details are not present in the context, say you don't have that data "
+        "instead of guessing. Be concise and clear."
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": f"Management data:\n\n{context}\n\n\nUser question: {question}",
+        },
+    ]
+
+    try:
+        stream = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages,
+            temperature=0.2,
+            stream=True,
+        )
+        full_content: List[str] = []
+        async for chunk in stream:
+            if chunk.choices and len(chunk.choices) > 0 and getattr(chunk.choices[0].delta, "content", None):
+                content = chunk.choices[0].delta.content
+                full_content.append(content)
+                yield {"type": "chunk", "content": content}
+        _ = "".join(full_content)
+    except openai.APIError as e:
+        raise ServiceError(f"OpenAI API error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception as e:
+        raise ServiceError(f"Error generating management answer: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    # For now we do not persist chat history; this can be added later.
+    yield {"type": "done"}
 
 
 async def create_lecture(
@@ -1253,7 +1481,7 @@ async def stop_recording(
     teacher_id: UUID,
     session_id: UUID,
 ) -> AILectureSession:
-    """Stop recording and transition to UPLOADING. No Whisper here; upload happens via WebSocket."""
+    """Stop recording; mark session as STOPPING and let WebSocket finalize audio and start background processing."""
     import logging
 
     logger = logging.getLogger(__name__)
@@ -1277,14 +1505,14 @@ async def stop_recording(
             elapsed = (now - session.recording_started_at).total_seconds()
             session.total_recording_seconds = int(session.total_recording_seconds + elapsed)
 
-    session.status = "UPLOADING"
+    # Mark as no longer actively recording; WebSocket will flush remaining audio and start processing on disconnect.
     session.is_active_recording = False
-    session.upload_progress_percent = 0
+    session.status = "STOPPING"
 
     await db.commit()
     await db.refresh(session)
 
-    logger.info(f"Recording stopped for session {session_id}, status=UPLOADING")
+    logger.info(f"Recording stopped for session {session_id}, status=STOPPING")
     return session
 
 
@@ -1336,9 +1564,29 @@ async def process_lecture_background(session_id: UUID) -> None:
                 await db.commit()
                 await connection_manager.send_to_channel(
                     connection_manager.channel_for_session(str(session_id)),
-                    {"status": "failed", "error": "Audio file not found"},
+                    {
+                        "status": "failed",
+                        "error": "Audio file not found",
+                        "upload_completed": bool(getattr(session, "upload_completed", False)),
+                        "processing_stage": "ERROR",
+                        "progress": getattr(session, "upload_progress_percent", 0),
+                    },
                 )
                 return
+
+            # At this point we have a valid audio file; notify UI that processing has really started.
+            session.processing_stage = "TRANSCRIBING"
+            session.upload_progress_percent = max(session.upload_progress_percent or 0, 10)
+            await db.commit()
+            await connection_manager.send_to_channel(
+                connection_manager.channel_for_session(str(session_id)),
+                {
+                    "status": "processing",
+                    "processing_stage": session.processing_stage,
+                    "upload_completed": bool(getattr(session, "upload_completed", False)),
+                    "progress": session.upload_progress_percent,
+                },
+            )
 
             with open(audio_path, "rb") as f:
                 audio_file = io.BytesIO(f.read())
@@ -1352,13 +1600,34 @@ async def process_lecture_background(session_id: UUID) -> None:
             transcript = transcription if isinstance(transcription, str) else transcription.text
             session.transcript = transcript
             session.processing_stage = "CHUNKING"
+            session.upload_progress_percent = max(session.upload_progress_percent or 0, 40)
             await db.commit()
+            await connection_manager.send_to_channel(
+                connection_manager.channel_for_session(str(session_id)),
+                {
+                    "status": "processing",
+                    "processing_stage": session.processing_stage,
+                    "upload_completed": bool(getattr(session, "upload_completed", False)),
+                    "progress": session.upload_progress_percent,
+                },
+            )
 
             chunks = chunk_text(transcript)
             session.processing_stage = "EMBEDDING"
+            session.upload_progress_percent = max(session.upload_progress_percent or 0, 60)
             await db.commit()
+            await connection_manager.send_to_channel(
+                connection_manager.channel_for_session(str(session_id)),
+                {
+                    "status": "processing",
+                    "processing_stage": session.processing_stage,
+                    "upload_completed": bool(getattr(session, "upload_completed", False)),
+                    "progress": session.upload_progress_percent,
+                },
+            )
 
-            for chunk_content in chunks:
+            total_chunks = len(chunks) or 1
+            for idx, chunk_content in enumerate(chunks, start=1):
                 embedding = await generate_embedding(chunk_content)
                 chunk = AILectureChunk(
                     tenant_id=tenant_id,
@@ -1368,6 +1637,23 @@ async def process_lecture_background(session_id: UUID) -> None:
                 )
                 db.add(chunk)
 
+                # Gradually increase progress from 60 → 95 during embedding
+                progress = 60 + int(35 * idx / total_chunks)
+                if progress > session.upload_progress_percent:
+                    session.upload_progress_percent = progress
+                    await db.commit()
+                    # Avoid spamming the channel on every tiny update; only send for meaningful changes
+                    if idx == 1 or idx == total_chunks or idx % 5 == 0:
+                        await connection_manager.send_to_channel(
+                            connection_manager.channel_for_session(str(session_id)),
+                            {
+                                "status": "processing",
+                                "processing_stage": session.processing_stage,
+                                "upload_completed": bool(getattr(session, "upload_completed", False)),
+                                "progress": session.upload_progress_percent,
+                            },
+                        )
+
             session.status = "COMPLETED"
             session.processing_stage = "DONE"
             session.upload_progress_percent = 100
@@ -1375,7 +1661,12 @@ async def process_lecture_background(session_id: UUID) -> None:
 
             await connection_manager.send_to_channel(
                 connection_manager.channel_for_session(str(session_id)),
-                {"status": "completed"},
+                {
+                    "status": "completed",
+                    "processing_stage": session.processing_stage,
+                    "upload_completed": bool(getattr(session, "upload_completed", False)),
+                    "progress": session.upload_progress_percent,
+                },
             )
         except openai.APIError as e:
             logger.exception("OpenAI API error in process_lecture_background")
@@ -1387,7 +1678,13 @@ async def process_lecture_background(session_id: UUID) -> None:
                     await db.commit()
                 await connection_manager.send_to_channel(
                     connection_manager.channel_for_session(str(session_id)),
-                    {"status": "failed", "error": str(e)},
+                    {
+                        "status": "failed",
+                        "error": str(e),
+                        "processing_stage": "ERROR",
+                        "upload_completed": bool(getattr(session, "upload_completed", False)) if session else False,
+                        "progress": getattr(session, "upload_progress_percent", 0) if session else 0,
+                    },
                 )
             except Exception:
                 pass
@@ -1401,7 +1698,13 @@ async def process_lecture_background(session_id: UUID) -> None:
                     await db.commit()
                 await connection_manager.send_to_channel(
                     connection_manager.channel_for_session(str(session_id)),
-                    {"status": "failed", "error": str(e)},
+                    {
+                        "status": "failed",
+                        "error": str(e),
+                        "processing_stage": "ERROR",
+                        "upload_completed": bool(getattr(session, "upload_completed", False)) if session else False,
+                        "progress": getattr(session, "upload_progress_percent", 0) if session else 0,
+                    },
                 )
             except Exception:
                 pass

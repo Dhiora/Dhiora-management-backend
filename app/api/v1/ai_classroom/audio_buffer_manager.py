@@ -74,6 +74,20 @@ class AudioBufferManager:
                 return 0
             return len(self.buffers[session_id])
 
+    async def pop_all(self, session_id: UUID) -> bytes:
+        """Atomically get and clear the buffer as bytes."""
+        lock = await self._get_lock(session_id)
+        async with lock:
+            if session_id not in self.buffers or not self.buffers[session_id]:
+                return b""
+            data = bytes(self.buffers[session_id])
+            self.buffers[session_id].clear()
+            return data
+
+    async def should_flush(self, session_id: UUID, threshold_bytes: int) -> bool:
+        """Return True if buffer size >= threshold."""
+        return (await self.get_size(session_id)) >= threshold_bytes
+
 
 buffer_manager = AudioBufferManager()
 

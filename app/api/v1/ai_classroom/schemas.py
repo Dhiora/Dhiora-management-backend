@@ -139,3 +139,14 @@ class StopRecordingResponse(BaseModel):
 class TranscriptUpdateRequest(BaseModel):
     transcript: str = Field(..., min_length=1)
 
+
+class ManagementChatRequest(BaseModel):
+    """Unified management chat request (organization-wide assistant).
+
+    NOTE: Organization/tenant scope is taken exclusively from the JWT token
+    (CurrentUser.tenant_id and academic_year_id). Do NOT accept any
+    organization/tenant identifiers from the request body.
+    """
+
+    message: str = Field(..., min_length=1)
+
