@@ -6,6 +6,7 @@ from typing import Dict, List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status
+from fastapi.responses import StreamingResponse
 from jose import JWTError, jwt
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -249,8 +250,6 @@ async def ask_doubt(
 
 @router.post(
     "/doubt/student",
-    response_model=DoubtAskResponse,
-    status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(get_current_user)],
     tags=["AI Classroom"],
 )
@@ -259,26 +258,32 @@ async def ask_doubt_student(
     db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
-    try:
-        chat, ai_message = await service.ask_doubt_student(
-            db,
-            current_user.tenant_id,
-            current_user.id,
-            payload,
-        )
-        return DoubtAskResponse(
-            chat_id=chat.id,
-            answer=ai_message.message,
-            message=_message_to_response(ai_message),
-        )
-    except ServiceError as e:
-        raise HTTPException(status_code=e.status_code, detail=e.message)
+    """Student doubt: returns Event Stream (SSE). Events: chunk (content), then done (chat_id, message)."""
+    async def event_stream():
+        try:
+            async for event in service.ask_doubt_student_stream(
+                db,
+                current_user.tenant_id,
+                current_user.id,
+                payload,
+            ):
+                yield f"data: {json.dumps(event)}\n\n"
+        except ServiceError as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': e.message, 'status_code': e.status_code})}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post(
     "/doubt/admin",
-    response_model=DoubtAskResponse,
-    status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(get_current_user)],
     tags=["AI Classroom"],
 )
@@ -287,20 +292,28 @@ async def ask_doubt_admin(
     db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
-    try:
-        chat, ai_message = await service.ask_doubt_admin(
-            db,
-            current_user.tenant_id,
-            current_user.id,
-            payload,
-        )
-        return DoubtAskResponse(
-            chat_id=chat.id,
-            answer=ai_message.message,
-            message=_message_to_response(ai_message),
-        )
-    except ServiceError as e:
-        raise HTTPException(status_code=e.status_code, detail=e.message)
+    """Admin doubt: returns Event Stream (SSE). Events: chunk (content), then done (chat_id, message)."""
+    async def event_stream():
+        try:
+            async for event in service.ask_doubt_admin_stream(
+                db,
+                current_user.tenant_id,
+                current_user.id,
+                payload,
+            ):
+                yield f"data: {json.dumps(event)}\n\n"
+        except ServiceError as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': e.message, 'status_code': e.status_code})}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get(

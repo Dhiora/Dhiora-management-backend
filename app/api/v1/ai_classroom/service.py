@@ -3,7 +3,7 @@
 import io
 import logging
 from datetime import datetime, timezone
-from typing import List, Optional, Tuple
+from typing import AsyncGenerator, List, Optional, Tuple
 from uuid import UUID
 
 import openai
@@ -575,6 +575,253 @@ async def _handle_ultra_doubt(
     return chat_obj, ai_message
 
 
+async def _stream_basic_doubt(
+    db: AsyncSession,
+    tenant_id: UUID,
+    user_id: UUID,
+    lecture_id: UUID,
+    subject_name: str,
+    topic_name: str,
+    message: str,
+    chat_id: Optional[UUID],
+) -> AsyncGenerator[dict, None]:
+    """Stream BASIC tier doubt response as SSE-style events."""
+    chunks = await get_similar_chunks(db, tenant_id, lecture_id, message, limit=5)
+    context = "\n\n".join(chunks)
+    system_prompt = (
+        f"You are a helpful teacher assistant for {subject_name}, topic: {topic_name}. "
+        "Answer the student's question ONLY using the lecture content provided below. "
+        f"If the answer is not in the lecture content, respond with: "
+        f"'This was not covered in today's lecture on {topic_name}.' "
+        "Keep answers clear, simple, and encouraging. Do not go beyond the lecture content."
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"Lecture content:\n\n{context}\n\n\nStudent question: {message}"},
+    ]
+    try:
+        stream = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages,
+            temperature=0.5,
+            stream=True,
+        )
+        full_content = []
+        async for chunk in stream:
+            if chunk.choices and len(chunk.choices) > 0 and chunk.choices[0].delta.content:
+                content = chunk.choices[0].delta.content
+                full_content.append(content)
+                yield {"type": "chunk", "content": content}
+        ai_answer = "".join(full_content)
+    except openai.APIError as e:
+        raise ServiceError(f"OpenAI API error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception as e:
+        raise ServiceError(f"Error generating answer: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
+    chat_obj = await _get_or_create_doubt_chat(db, tenant_id, user_id, lecture_id, chat_id)
+    student_message = AIDoubtMessage(chat_id=chat_obj.id, role="STUDENT", message=message)
+    db.add(student_message)
+    ai_message = AIDoubtMessage(chat_id=chat_obj.id, role="AI", message=ai_answer)
+    db.add(ai_message)
+    await db.commit()
+    await db.refresh(chat_obj)
+    await db.refresh(ai_message)
+    yield {
+        "type": "done",
+        "chat_id": str(chat_obj.id),
+        "message": {
+            "id": str(ai_message.id),
+            "chat_id": str(ai_message.chat_id),
+            "role": ai_message.role,
+            "message": ai_message.message,
+            "created_at": ai_message.created_at.isoformat() if ai_message.created_at else None,
+        },
+    }
+
+
+async def _stream_pro_doubt(
+    db: AsyncSession,
+    tenant_id: UUID,
+    user_id: UUID,
+    lecture_id: UUID,
+    subject_name: str,
+    topic_name: str,
+    message: str,
+    chat_id: Optional[UUID],
+    message_type: str,
+) -> AsyncGenerator[dict, None]:
+    """Stream PRO tier doubt response as SSE-style events."""
+    chunks = await get_similar_chunks(db, tenant_id, lecture_id, message, limit=5)
+    context = "\n\n".join(chunks)
+    chat_obj = await _get_or_create_doubt_chat(db, tenant_id, user_id, lecture_id, chat_id)
+    history = await get_chat_history(db, chat_obj.id)
+    if message_type == "QUESTION":
+        system_prompt = (
+            f"You are an expert teacher for {subject_name}, topic: {topic_name}. "
+            "STEP 1: Answer the student's question clearly using only the lecture content below. "
+            "STEP 2: After your answer, always end with ONE comprehension check question. "
+            "Format it exactly as: 'Quick check: [your question]' "
+            f"Lecture content:\n{context}\n\nRules: "
+            "Answer only from lecture content. "
+            "Comprehension question must be about what you just explained. Be encouraging and clear."
+        )
+    else:
+        system_prompt = (
+            f"You are an expert teacher for {subject_name}, topic: {topic_name}. "
+            "The student just answered your comprehension check question. "
+            "STEP 1: Evaluate if their answer is correct or not. "
+            "STEP 2A: If CORRECT → Praise briefly + ask 'Do you have any other doubts?' "
+            "STEP 2B: If WRONG or INCOMPLETE → Gently say it is not quite right; "
+            "Re-explain using a DIFFERENT approach (use analogy, real example, or simpler breakdown); "
+            "Ask the same comprehension question again but phrased differently. "
+            f"Lecture content:\n{context}"
+        )
+    messages = [{"role": "system", "content": system_prompt}]
+    for h in history:
+        messages.append({"role": h["role"], "content": h["content"]})
+    messages.append({"role": "user", "content": message})
+    try:
+        stream = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages,
+            temperature=0.7,
+            stream=True,
+        )
+        full_content = []
+        async for chunk in stream:
+            if chunk.choices and len(chunk.choices) > 0 and chunk.choices[0].delta.content:
+                content = chunk.choices[0].delta.content
+                full_content.append(content)
+                yield {"type": "chunk", "content": content}
+        ai_answer = "".join(full_content)
+    except openai.APIError as e:
+        raise ServiceError(f"OpenAI API error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception as e:
+        raise ServiceError(f"Error generating answer: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
+    student_message = AIDoubtMessage(chat_id=chat_obj.id, role="STUDENT", message=message)
+    db.add(student_message)
+    ai_message = AIDoubtMessage(chat_id=chat_obj.id, role="AI", message=ai_answer)
+    db.add(ai_message)
+    await db.commit()
+    await db.refresh(chat_obj)
+    await db.refresh(ai_message)
+    yield {
+        "type": "done",
+        "chat_id": str(chat_obj.id),
+        "message": {
+            "id": str(ai_message.id),
+            "chat_id": str(ai_message.chat_id),
+            "role": ai_message.role,
+            "message": ai_message.message,
+            "created_at": ai_message.created_at.isoformat() if ai_message.created_at else None,
+        },
+    }
+
+
+async def _stream_ultra_doubt(
+    db: AsyncSession,
+    tenant_id: UUID,
+    user_id: UUID,
+    lecture_id: UUID,
+    subject_name: str,
+    topic_name: str,
+    message: str,
+    chat_id: Optional[UUID],
+    session_stage: str,
+) -> AsyncGenerator[dict, None]:
+    """Stream ULTRA tier doubt response as SSE-style events."""
+    chunks = await get_similar_chunks(db, tenant_id, lecture_id, topic_name, limit=5)
+    context = "\n\n".join(chunks)
+    chat_obj = await _get_or_create_doubt_chat(db, tenant_id, user_id, lecture_id, chat_id)
+    history_raw = await get_chat_history(db, chat_obj.id)
+    history = history_raw[-10:]
+    stage_prompts = {
+        "START": (
+            f"You are an elite IIT-level mentor for {subject_name}. Today's topic: {topic_name}. "
+            f"Lecture content:\n{context}\n\nYour task: "
+            "Give a sharp 3-line recap of what was taught in the lecture. "
+            "Say: 'Now let me show you what IIT toppers know about this that most students miss'. "
+            f"Share ONE advanced insight about {topic_name} that goes beyond the lecture. "
+            "End with: 'Ready to be challenged at the next level? Reply yes to begin.' "
+            "Tone: Confident, exciting, like a mentor who believes in this student."
+        ),
+        "TEACHING": (
+            f"You are an elite IIT-level mentor for {subject_name}, topic: {topic_name}. "
+            "The student wants to go deeper. You are in TEACHING mode. "
+            "Your task: Teach the advanced version of {topic_name} beyond what the lecture covered. "
+            "Show how this topic appears in real IIT exam questions. "
+            "Teach one powerful problem-solving technique IIT toppers use for this topic. "
+            "End with: 'Now I will give you 3 questions — easy to IIT-hard. Type ready when you are.' "
+            f"Lecture base:\n{context}"
+        ),
+        "CHALLENGING": (
+            f"You are an IIT-level examiner for {subject_name}, topic: {topic_name}. "
+            "You are in CHALLENGE mode. Ask 3 questions progressively: "
+            "Question 1: Board/NCERT level (build confidence); "
+            "Question 2: JEE Mains level (push them); "
+            "Question 3: JEE Advanced level (real IIT challenge). "
+            "Rules for each answer: CORRECT → Praise + explain the deeper insight + move to next question. "
+            "WRONG → Identify the exact mistake + explain the correct approach + ask a different question at the same difficulty. "
+            "'I don't know' → Teach that concept clearly + ask a simpler version of same question. "
+            "Always show: 'Question [X] of 3' at the start of each question. "
+            "After all 3 questions are done, tell student to type 'evaluate me'. "
+            f"Lecture content:\n{context}"
+        ),
+        "EVALUATING": (
+            f"You are an IIT mentor giving end-of-session feedback for {topic_name}. "
+            "Based on this conversation, give the student: "
+            "A score: X/10 for this session with one sentence explanation. "
+            "What they understood well (be specific, not generic). "
+            "One or two gaps they need to work on. "
+            "ONE homework problem at IIT level to solve before next class. "
+            "A closing motivational message — make it personal to what THEY showed in this session, not a generic 'you can do it'. "
+            "This should feel like a real mentor's honest debrief, not a report card."
+        ),
+    }
+    system_prompt = stage_prompts.get(session_stage, stage_prompts["START"])
+    messages = [{"role": "system", "content": system_prompt}]
+    for h in history:
+        messages.append({"role": h["role"], "content": h["content"]})
+    if message:
+        messages.append({"role": "user", "content": message})
+    try:
+        stream = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages,
+            temperature=0.8,
+            stream=True,
+        )
+        full_content = []
+        async for chunk in stream:
+            if chunk.choices and len(chunk.choices) > 0 and chunk.choices[0].delta.content:
+                content = chunk.choices[0].delta.content
+                full_content.append(content)
+                yield {"type": "chunk", "content": content}
+        ai_answer = "".join(full_content)
+    except openai.APIError as e:
+        raise ServiceError(f"OpenAI API error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception as e:
+        raise ServiceError(f"Error generating answer: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
+    chat_obj.session_stage = session_stage
+    student_message = AIDoubtMessage(chat_id=chat_obj.id, role="STUDENT", message=message)
+    db.add(student_message)
+    ai_message = AIDoubtMessage(chat_id=chat_obj.id, role="AI", message=ai_answer)
+    db.add(ai_message)
+    await db.commit()
+    await db.refresh(chat_obj)
+    await db.refresh(ai_message)
+    yield {
+        "type": "done",
+        "chat_id": str(chat_obj.id),
+        "message": {
+            "id": str(ai_message.id),
+            "chat_id": str(ai_message.chat_id),
+            "role": ai_message.role,
+            "message": ai_message.message,
+            "created_at": ai_message.created_at.isoformat() if ai_message.created_at else None,
+        },
+    }
+
+
 async def ask_doubt_student(
     db: AsyncSession,
     tenant_id: UUID,
@@ -612,6 +859,50 @@ async def ask_doubt_student(
         payload.subject_name, payload.topic_name, payload.message, payload.chat_id,
         payload.session_stage or "START",
     )
+
+
+async def ask_doubt_student_stream(
+    db: AsyncSession,
+    tenant_id: UUID,
+    student_id: UUID,
+    payload: StudentDoubtRequest,
+) -> AsyncGenerator[dict, None]:
+    """
+    Student doubt endpoint (Event Stream). Same validation as ask_doubt_student;
+    streams AI response as SSE events: chunk, then done.
+    """
+    user = await db.get(User, student_id)
+    if not user or user.tenant_id != tenant_id:
+        raise ServiceError("Student not found", status.HTTP_404_NOT_FOUND)
+    if user.user_type != "student":
+        raise ServiceError("Only students can use this endpoint", status.HTTP_403_FORBIDDEN)
+    lecture = await db.get(AILectureSession, payload.lecture_id)
+    if not lecture or lecture.tenant_id != tenant_id:
+        raise ServiceError("Lecture not found", status.HTTP_404_NOT_FOUND)
+    plan = getattr(user, "subscription_plan", "BASIC")
+    if plan not in ("BASIC", "PRO", "ULTRA"):
+        plan = "BASIC"
+    if plan == "BASIC":
+        async for event in _stream_basic_doubt(
+            db, tenant_id, student_id, payload.lecture_id,
+            payload.subject_name, payload.topic_name, payload.message, payload.chat_id,
+        ):
+            yield event
+        return
+    if plan == "PRO":
+        async for event in _stream_pro_doubt(
+            db, tenant_id, student_id, payload.lecture_id,
+            payload.subject_name, payload.topic_name, payload.message, payload.chat_id,
+            payload.message_type or "QUESTION",
+        ):
+            yield event
+        return
+    async for event in _stream_ultra_doubt(
+        db, tenant_id, student_id, payload.lecture_id,
+        payload.subject_name, payload.topic_name, payload.message, payload.chat_id,
+        payload.session_stage or "START",
+    ):
+        yield event
 
 
 async def ask_doubt_admin(
@@ -652,6 +943,52 @@ async def ask_doubt_admin(
         payload.subject_name, payload.topic_name, payload.message, payload.chat_id,
         payload.session_stage or "START",
     )
+
+
+async def ask_doubt_admin_stream(
+    db: AsyncSession,
+    tenant_id: UUID,
+    admin_id: UUID,
+    payload: AdminDoubtRequest,
+) -> AsyncGenerator[dict, None]:
+    """
+    Admin doubt endpoint (Event Stream). Same validation as ask_doubt_admin;
+    streams AI response as SSE events: chunk, then done.
+    """
+    user = await db.get(User, admin_id)
+    if not user or user.tenant_id != tenant_id:
+        raise ServiceError("Admin user not found", status.HTTP_404_NOT_FOUND)
+    is_admin = user.role in ("SUPER_ADMIN", "PLATFORM_ADMIN", "ADMIN") or user.user_type == "employee"
+    if not is_admin:
+        raise ServiceError("Only admins or employees can use this endpoint", status.HTTP_403_FORBIDDEN)
+    lecture = await db.get(AILectureSession, payload.lecture_id)
+    if not lecture or lecture.tenant_id != tenant_id:
+        raise ServiceError("Lecture not found", status.HTTP_404_NOT_FOUND)
+    logging.getLogger(__name__).info(
+        "Admin %s using tier %s for lecture %s (stream)", admin_id, payload.tier, payload.lecture_id
+    )
+    tier = payload.tier
+    if tier == "BASIC":
+        async for event in _stream_basic_doubt(
+            db, tenant_id, admin_id, payload.lecture_id,
+            payload.subject_name, payload.topic_name, payload.message, payload.chat_id,
+        ):
+            yield event
+        return
+    if tier == "PRO":
+        async for event in _stream_pro_doubt(
+            db, tenant_id, admin_id, payload.lecture_id,
+            payload.subject_name, payload.topic_name, payload.message, payload.chat_id,
+            payload.message_type or "QUESTION",
+        ):
+            yield event
+        return
+    async for event in _stream_ultra_doubt(
+        db, tenant_id, admin_id, payload.lecture_id,
+        payload.subject_name, payload.topic_name, payload.message, payload.chat_id,
+        payload.session_stage or "START",
+    ):
+        yield event
 
 
 async def get_lecture(
