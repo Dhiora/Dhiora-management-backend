@@ -649,27 +649,38 @@ async def websocket_stream(
 
             while True:
                 try:
-                    audio_bytes = await websocket.receive_bytes()
-                    if not audio_bytes:
+                    # Use receive() so we can handle both binary (audio) and text frames without KeyError.
+                    # receive_bytes() raises when client sends a text frame (e.g. ping/JSON).
+                    message = await websocket.receive()
+                    msg_type = message.get("type")
+
+                    if msg_type == "websocket.disconnect":
+                        break
+
+                    if msg_type != "websocket.receive":
                         continue
 
-                    await buffer_manager.append_chunk(session_id, audio_bytes)
+                    # Only process binary frames as audio; ignore text frames (no KeyError).
+                    audio_bytes = message.get("bytes")
+                    if audio_bytes and len(audio_bytes) > 0:
+                        await buffer_manager.append_chunk(session_id, audio_bytes)
 
-                    # Flush to disk only when threshold reached
-                    if await buffer_manager.should_flush(session_id, FLUSH_THRESHOLD_BYTES):
-                        data_to_write = await buffer_manager.pop_all(session_id)
-                        if data_to_write:
-                            f.write(data_to_write)
-                            f.flush()
+                        # Flush to disk only when threshold reached
+                        if await buffer_manager.should_flush(session_id, FLUSH_THRESHOLD_BYTES):
+                            data_to_write = await buffer_manager.pop_all(session_id)
+                            if data_to_write:
+                                f.write(data_to_write)
+                                f.flush()
 
-                    # Lightweight session heartbeat (optional)
-                    session = await service.get_recording_session(
-                        db, current_user.tenant_id, session_id, teacher_id=current_user.id
-                    )
-                    if session and session.status in ("RECORDING", "PAUSED", "STOPPING"):
-                        session.last_chunk_received_at = datetime.now(timezone.utc)
-                        session.audio_buffer_size_bytes = await buffer_manager.get_size(session_id)
-                        await db.commit()
+                        # Lightweight session heartbeat (optional)
+                        session = await service.get_recording_session(
+                            db, current_user.tenant_id, session_id, teacher_id=current_user.id
+                        )
+                        if session and session.status in ("RECORDING", "PAUSED", "STOPPING"):
+                            session.last_chunk_received_at = datetime.now(timezone.utc)
+                            session.audio_buffer_size_bytes = await buffer_manager.get_size(session_id)
+                            await db.commit()
+                    # If "text" in message: client sent a text frame; ignore and keep listening for binary.
 
                 except WebSocketDisconnect:
                     break

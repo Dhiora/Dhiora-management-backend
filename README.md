@@ -28,8 +28,15 @@ pip install -r requirements.txt
 
 4. Run the app:
 
+For local development with AI Classroom WebSockets (long-running audio recordings), use
+uvicorn with relaxed WebSocket ping/timeout settings so the server does not close the
+connection while recording:
+
 ```bash
-uvicorn app.main:app --reload
+uvicorn app.main:app --reload \
+  --ws websockets \
+  --ws-ping-interval 20 \
+  --ws-ping-timeout 300
 ```
 
 The auth endpoints will be available under `/api/v1/auth`.

@@ -1481,7 +1481,9 @@ async def stop_recording(
     teacher_id: UUID,
     session_id: UUID,
 ) -> AILectureSession:
-    """Stop recording; mark session as STOPPING and let WebSocket finalize audio and start background processing."""
+    """Stop recording; mark session as STOPPING and let WebSocket finalize audio and start background processing.
+    Idempotent: if already STOPPING, PROCESSING, COMPLETED, or FAILED, return current session without error.
+    """
     import logging
 
     logger = logging.getLogger(__name__)
@@ -1492,6 +1494,17 @@ async def stop_recording(
 
     if session.teacher_id != teacher_id:
         raise ServiceError("You do not own this session", status.HTTP_403_FORBIDDEN)
+
+    # If stop is called when the session is already stopping/processing/completed/failed,
+    # just return the current state instead of raising. This makes the endpoint idempotent
+    # and avoids errors on double-click or late stop calls.
+    if session.status in ("STOPPING", "PROCESSING", "COMPLETED", "FAILED"):
+        logger.info(
+            "Stop called for session %s with status %s; returning current state",
+            session_id,
+            session.status,
+        )
+        return session
 
     if session.status not in ("RECORDING", "PAUSED"):
         raise ServiceError(f"Cannot stop session with status: {session.status}", status.HTTP_400_BAD_REQUEST)
