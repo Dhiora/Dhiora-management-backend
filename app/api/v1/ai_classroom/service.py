@@ -117,7 +117,7 @@ def clean_audio(input_path: str) -> str:
 
 
 async def transcribe_audio(file: UploadFile) -> str:
-    """Transcribe audio: save to temp file → clean with FFmpeg → send cleaned WAV to Whisper."""
+    """Transcribe audio: save to temp file → send audio directly to Whisper."""
     if not file.content_type or not file.content_type.startswith("audio/"):
         raise ServiceError("Invalid file type. Expected audio file.", status.HTTP_400_BAD_REQUEST)
 
@@ -135,7 +135,6 @@ async def transcribe_audio(file: UploadFile) -> str:
         suffix = "." + file.filename.rsplit(".", 1)[-1].lower()
 
     temp_input_path = None
-    cleaned_path = None
 
     try:
         contents = await file.read()
@@ -143,11 +142,10 @@ async def transcribe_audio(file: UploadFile) -> str:
             tmp.write(contents)
             temp_input_path = tmp.name
 
-        cleaned_path = await asyncio.to_thread(clean_audio, temp_input_path)
-
-        with open(cleaned_path, "rb") as f:
+        # Do not call clean_audio(); send original audio to Whisper as-is.
+        with open(temp_input_path, "rb") as f:
             audio_file = io.BytesIO(f.read())
-        audio_file.name = "audio.wav"
+        audio_file.name = file.filename or f"audio{suffix}"
 
         transcription = await client.audio.transcriptions.create(
             model="whisper-1",
@@ -170,11 +168,6 @@ async def transcribe_audio(file: UploadFile) -> str:
                 os.unlink(temp_input_path)
             except OSError:
                 pass
-        if cleaned_path and os.path.exists(cleaned_path):
-            try:
-                os.unlink(cleaned_path)
-            except OSError:
-                pass
 
 
 async def generate_embedding(text: str) -> List[float]:
@@ -185,6 +178,23 @@ async def generate_embedding(text: str) -> List[float]:
             input=text,
         )
         return response.data[0].embedding
+    except openai.APIError as e:
+        raise ServiceError(f"OpenAI API error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception as e:
+        raise ServiceError(f"Embedding generation error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+async def generate_embeddings_batch(texts: List[str]) -> List[List[float]]:
+    """Generate embeddings for multiple texts in a single API call (much faster than sequential calls)."""
+    if not texts:
+        return []
+    try:
+        response = await client.embeddings.create(
+            model="text-embedding-3-small",
+            input=texts,
+        )
+        # API guarantees ordering by index
+        return [item.embedding for item in sorted(response.data, key=lambda x: x.index)]
     except openai.APIError as e:
         raise ServiceError(f"OpenAI API error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
     except Exception as e:
@@ -435,15 +445,16 @@ async def create_lecture(
     await db.flush()
 
     chunks = chunk_text(transcript)
-    for chunk_content in chunks:
-        embedding = await generate_embedding(chunk_content)
-        chunk = AILectureChunk(
-            tenant_id=tenant_id,
-            lecture_id=lecture.id,
-            content=chunk_content,
-            embedding=embedding,
-        )
-        db.add(chunk)
+    if chunks:
+        embeddings = await generate_embeddings_batch(chunks)
+        for chunk_content, embedding in zip(chunks, embeddings):
+            chunk = AILectureChunk(
+                tenant_id=tenant_id,
+                lecture_id=lecture.id,
+                content=chunk_content,
+                embedding=embedding,
+            )
+            db.add(chunk)
 
     await db.commit()
     await db.refresh(lecture)
@@ -1429,7 +1440,12 @@ async def start_recording(
     from app.api.v1.ai_classroom.audio_buffer_manager import buffer_manager
 
     logger = logging.getLogger(__name__)
-    await buffer_manager.initialize(session.id)
+    await buffer_manager.initialize(
+        session.id,
+        target_chunk_bytes=5 * 1024 * 1024,  # 5MB default; overridden by WebSocket handler
+        overlap_bytes=0,
+        max_buffer_size_bytes=5 * 1024 * 1024,
+    )
     logger.info(f"Recording started for session {session.id}, teacher {teacher_id}")
 
     return session
@@ -1639,8 +1655,18 @@ async def process_lecture_background(session_id: UUID) -> None:
                 },
             )
 
-            with open(audio_path, "rb") as f:
-                audio_file = io.BytesIO(f.read())
+            audio_bytes = await asyncio.to_thread(lambda: open(audio_path, "rb").read())
+            if not audio_bytes:
+                session.status = "FAILED"
+                session.processing_stage = "ERROR"
+                await db.commit()
+                await connection_manager.send_to_channel(
+                    connection_manager.channel_for_session(str(session_id)),
+                    {"status": "failed", "error": "Audio file is empty — no audio was recorded.", "processing_stage": "ERROR", "progress": 0},
+                )
+                return
+
+            audio_file = io.BytesIO(audio_bytes)
             audio_file.name = "lecture.webm"
 
             transcription = await client.audio.transcriptions.create(
@@ -1678,9 +1704,9 @@ async def process_lecture_background(session_id: UUID) -> None:
                 },
             )
 
-            total_chunks = len(chunks) or 1
-            for idx, chunk_content in enumerate(chunks, start=1):
-                embedding = await generate_embedding(chunk_content)
+            # Generate all embeddings in a single batch API call instead of one-per-chunk
+            chunk_embeddings = await generate_embeddings_batch(chunks)
+            for chunk_content, embedding in zip(chunks, chunk_embeddings):
                 chunk = AILectureChunk(
                     tenant_id=tenant_id,
                     lecture_id=session.id,
@@ -1689,22 +1715,17 @@ async def process_lecture_background(session_id: UUID) -> None:
                 )
                 db.add(chunk)
 
-                # Gradually increase progress from 60 → 95 during embedding
-                progress = 60 + int(35 * idx / total_chunks)
-                if progress > session.upload_progress_percent:
-                    session.upload_progress_percent = progress
-                    await db.commit()
-                    # Avoid spamming the channel on every tiny update; only send for meaningful changes
-                    if idx == 1 or idx == total_chunks or idx % 5 == 0:
-                        await connection_manager.send_to_channel(
-                            connection_manager.channel_for_session(str(session_id)),
-                            {
-                                "status": "processing",
-                                "processing_stage": session.processing_stage,
-                                "upload_completed": bool(getattr(session, "upload_completed", False)),
-                                "progress": session.upload_progress_percent,
-                            },
-                        )
+            session.upload_progress_percent = 95
+            await db.commit()
+            await connection_manager.send_to_channel(
+                connection_manager.channel_for_session(str(session_id)),
+                {
+                    "status": "processing",
+                    "processing_stage": session.processing_stage,
+                    "upload_completed": bool(getattr(session, "upload_completed", False)),
+                    "progress": session.upload_progress_percent,
+                },
+            )
 
             session.status = "COMPLETED"
             session.processing_stage = "DONE"
@@ -1813,8 +1834,8 @@ async def update_transcript(
         chunks = chunk_text(new_transcript)
         logger.info(f"Generated {len(chunks)} chunks for lecture {lecture_id}")
 
-        for chunk_content in chunks:
-            embedding = await generate_embedding(chunk_content)
+        embeddings = await generate_embeddings_batch(chunks)
+        for chunk_content, embedding in zip(chunks, embeddings):
             chunk = AILectureChunk(
                 tenant_id=tenant_id,
                 lecture_id=lecture.id,
