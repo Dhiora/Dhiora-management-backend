@@ -818,7 +818,11 @@ async def websocket_stream(
                 except Exception:
                     logger.exception("Failed to transition session %s to PROCESSING (realtime)", session_id)
 
-                await realtime_pipeline.stop(session_id, drain_timeout_s=20.0)
+                await realtime_pipeline.stop(
+                    session_id,
+                    drain_timeout_s=20.0,
+                    whisper_timeout_s=real_cfg.whisper_timeout_s,
+                )
 
                 try:
                     session = await service.get_recording_session(

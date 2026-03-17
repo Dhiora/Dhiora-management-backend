@@ -41,6 +41,25 @@ from .schemas import (
 client = AsyncOpenAI(api_key=settings.openai_api_key)
 logger = logging.getLogger(__name__)
 
+# ── Model strategy ────────────────────────────────────────────────────────────
+MODEL_BASIC   = "gpt-4o-mini"   # cheap, fast — sufficient for simple Q&A
+MODEL_PRO     = "gpt-4o"        # full power for interactive teaching
+MODEL_ULTRA   = "gpt-4o"        # full power for IIT-level mentoring
+MODEL_MGMT    = "gpt-4o-mini"   # management chat — factual retrieval, no deep reasoning needed
+
+_CONTEXT_MAX_CHARS = 2000  # ~500 tokens — covers 3-4 relevant chunks comfortably
+
+
+def limit_context(chunks: List[str], max_chars: int = _CONTEXT_MAX_CHARS) -> str:
+    """Join chunks up to max_chars. Keeps the most relevant (top-ranked) chunks first."""
+    result, total = [], 0
+    for chunk in chunks:
+        if total + len(chunk) > max_chars:
+            break
+        result.append(chunk)
+        total += len(chunk)
+    return "\n\n".join(result)
+
 
 def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
     """Split text into semantic chunks with overlap."""
@@ -116,6 +135,201 @@ def clean_audio(input_path: str) -> str:
         raise ServiceError("FFmpeg not found; install FFmpeg and ensure it is in PATH", status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+MULTILINGUAL_PROMPT = (
+    "Transcribe exactly what is spoken. Do not translate to English. "
+    "Write the words as they are spoken in the original language."
+)
+
+import json as _json
+import re
+from collections import OrderedDict
+
+_INDIAN_WORD_RE = re.compile(r"[\u0900-\u0D7F]+")  # matches contiguous Indian script sequences
+
+# In-memory LRU cache: word → romanized form
+# Grows up to 10,000 entries then evicts oldest — covers virtually all classroom vocabulary
+_TRANSLITERATION_CACHE: OrderedDict[str, str] = OrderedDict()
+_CACHE_MAX_SIZE = 10_000
+
+
+def _cache_get(word: str) -> Optional[str]:
+    val = _TRANSLITERATION_CACHE.get(word)
+    if val is not None:
+        _TRANSLITERATION_CACHE.move_to_end(word)  # mark as recently used
+    return val
+
+
+def _cache_set(word: str, romanized: str) -> None:
+    if word in _TRANSLITERATION_CACHE:
+        _TRANSLITERATION_CACHE.move_to_end(word)
+    else:
+        if len(_TRANSLITERATION_CACHE) >= _CACHE_MAX_SIZE:
+            _TRANSLITERATION_CACHE.popitem(last=False)  # evict oldest
+        _TRANSLITERATION_CACHE[word] = romanized
+
+
+async def romanize_indian_script(text: str) -> str:
+    """
+    Efficiently romanize only the Indian script words in a transcript.
+
+    Steps:
+      1. Extract unique Indian script word sequences (e.g. చేస్తే, వెళుతుంది).
+      2. If none found → return text unchanged (zero API cost).
+      3. Send ONLY those words to GPT-4o-mini and get a JSON mapping.
+      4. Replace each Indian word in the original text with its Roman form.
+
+    Example:
+      Input : "Bike sudden ga stop చేస్తే, body forward కి వెళుతుంది"
+      Sends : "చేస్తే, కి, వెళుతుంది"  ← only these ~3 words to GPT
+      Output: "Bike sudden ga stop chesthe, body forward ki velthundi"
+    """
+    if not text:
+        return text
+
+    # Step 1: find unique Indian script words
+    all_matches = _INDIAN_WORD_RE.findall(text)
+    if not all_matches:
+        return text  # no Indian script — zero API cost
+
+    unique_words = list(dict.fromkeys(all_matches))
+
+    # Step 2: split into cached vs uncached
+    mapping: dict[str, str] = {}
+    missing: list[str] = []
+    for word in unique_words:
+        cached = _cache_get(word)
+        if cached is not None:
+            mapping[word] = cached  # cache hit — free
+        else:
+            missing.append(word)  # needs GPT
+
+    # Step 3: call GPT-4o-mini ONLY for words not in cache
+    if missing:
+        try:
+            response = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a transliterator for Indian languages. "
+                            "I will give you a comma-separated list of Indian script words. "
+                            "Return a JSON object mapping each word to its phonetic Roman transliteration "
+                            "exactly as it sounds (colloquial style, not IAST). "
+                            'Example: {"చేస్తే": "chesthe", "కి": "ki", "వెళుతుంది": "velthundi"}'
+                        ),
+                    },
+                    {"role": "user", "content": ", ".join(missing)},
+                ],
+                temperature=0,
+                max_tokens=len(missing) * 15,
+                response_format={"type": "json_object"},
+            )
+            new_mappings: dict = _json.loads(response.choices[0].message.content)
+            for original, romanized in new_mappings.items():
+                if romanized:
+                    _cache_set(original, romanized)   # store in cache for next time
+                    mapping[original] = romanized
+        except Exception as e:
+            logger.warning("Romanization step failed, keeping original transcript: %s", e)
+
+    # Step 4: replace all Indian words (cached + newly fetched)
+    result = text
+    for original, romanized in mapping.items():
+        result = result.replace(original, romanized)
+    return result
+
+
+async def _transcribe_file_path(audio_path: str, filename: str = "audio.webm") -> str:
+    """Transcribe a single file path, returning romanized text."""
+    audio_bytes = await asyncio.to_thread(lambda: open(audio_path, "rb").read())
+    if not audio_bytes:
+        return ""
+    audio_file = io.BytesIO(audio_bytes)
+    audio_file.name = filename
+    result = await client.audio.transcriptions.create(
+        model="whisper-1",
+        file=audio_file,
+        response_format="verbose_json",
+        temperature=0.2,
+        prompt=MULTILINGUAL_PROMPT,
+    )
+    raw = result if isinstance(result, str) else result.text
+    return await romanize_indian_script(raw)
+
+
+async def transcribe_in_chunks(audio_path: str, chunk_duration_s: int = 30) -> str:
+    """
+    Split audio into N-second chunks via ffmpeg, transcribe each with Whisper,
+    then concatenate. Each chunk uses the tail of the previous transcript as prompt
+    for context continuity (especially important for mixed-language content).
+
+    Falls back to single-file transcription if ffmpeg splitting fails.
+    """
+    import glob
+    import shutil
+
+    tmpdir = tempfile.mkdtemp(prefix="lecture_chunks_")
+    chunk_pattern = os.path.join(tmpdir, "chunk_%04d.webm")
+
+    try:
+        cmd = [
+            "ffmpeg", "-y", "-i", audio_path,
+            "-f", "segment",
+            "-segment_time", str(chunk_duration_s),
+            "-reset_timestamps", "1",
+            "-c", "copy",
+            chunk_pattern,
+        ]
+        proc = await asyncio.to_thread(
+            subprocess.run, cmd, capture_output=True, text=True, timeout=300
+        )
+
+        chunk_files = sorted(glob.glob(os.path.join(tmpdir, "chunk_*.webm")))
+        if not chunk_files:
+            logger.warning("ffmpeg produced no chunks, falling back to full-file transcription")
+            return await _transcribe_file_path(audio_path)
+
+        transcript_parts: List[str] = []
+        for chunk_path in chunk_files:
+            chunk_bytes = await asyncio.to_thread(lambda p=chunk_path: open(p, "rb").read())
+            if not chunk_bytes:
+                continue
+
+            # Use tail of previous text as context prompt for continuity
+            prev_tail = " ".join(" ".join(transcript_parts).split()[-50:]) if transcript_parts else ""
+            contextual_prompt = (MULTILINGUAL_PROMPT + " " + prev_tail).strip()
+
+            audio_file = io.BytesIO(chunk_bytes)
+            audio_file.name = "chunk.webm"
+            try:
+                result = await client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file,
+                    response_format="verbose_json",
+                    temperature=0.2,
+                    prompt=contextual_prompt,
+                )
+                raw = result if isinstance(result, str) else result.text
+                if raw:
+                    romanized = await romanize_indian_script(raw)
+                    transcript_parts.append(romanized)
+                    logger.info("Chunk %s transcribed: %d chars", os.path.basename(chunk_path), len(romanized))
+            except Exception as e:
+                logger.warning("Chunk %s transcription failed: %s", chunk_path, e)
+
+        return " ".join(transcript_parts)
+
+    except Exception as e:
+        logger.warning("Chunked transcription failed (%s), falling back to full-file", e)
+        return await _transcribe_file_path(audio_path)
+    finally:
+        try:
+            shutil.rmtree(tmpdir)
+        except Exception:
+            pass
+
+
 async def transcribe_audio(file: UploadFile) -> str:
     """Transcribe audio: save to temp file → send audio directly to Whisper."""
     if not file.content_type or not file.content_type.startswith("audio/"):
@@ -150,12 +364,13 @@ async def transcribe_audio(file: UploadFile) -> str:
         transcription = await client.audio.transcriptions.create(
             model="whisper-1",
             file=audio_file,
-            temperature=0,
+            temperature=0.2,
             response_format="verbose_json",
+            prompt=MULTILINGUAL_PROMPT,
         )
         raw_transcript = transcription if isinstance(transcription, str) else transcription.text
         logger.info("Whisper raw transcript (upload endpoint): %s", raw_transcript)
-        return raw_transcript
+        return await romanize_indian_script(raw_transcript)
     except ServiceError:
         raise
     except openai.APIError as e:
@@ -374,7 +589,7 @@ async def management_chat_stream(
 
     try:
         stream = await client.chat.completions.create(
-            model="gpt-4o",
+            model=MODEL_MGMT,
             messages=messages,
             temperature=0.2,
             stream=True,
@@ -515,7 +730,7 @@ If the answer is not found in the context, politely say that this topic was not 
 
     try:
         response = await client.chat.completions.create(
-            model="gpt-4o",
+            model=MODEL_BASIC,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Context from lecture:\n\n{context}\n\n\nStudent question: {payload.question}"},
@@ -660,6 +875,33 @@ async def _get_or_create_doubt_chat(
     return chat_obj
 
 
+_INDIAN_LANGUAGE_SUBJECTS = {
+    "telugu": "Telugu",
+    "hindi": "Hindi",
+    "kannada": "Kannada",
+    "tamil": "Tamil",
+    "malayalam": "Malayalam",
+    "marathi": "Marathi",
+    "bengali": "Bengali",
+    "urdu": "Urdu",
+    "sanskrit": "Sanskrit",
+    "punjabi": "Punjabi",
+}
+
+
+def _language_instruction(subject_name: str) -> str:
+    """Return a reply-language instruction based on subject name."""
+    subject_lower = subject_name.lower()
+    for key, lang in _INDIAN_LANGUAGE_SUBJECTS.items():
+        if key in subject_lower:
+            return (
+                f"IMPORTANT: This is a {lang} language subject. "
+                f"Reply entirely in {lang} using Roman/phonetic script only (no native script). "
+                f"Write {lang} words as they sound in Roman letters, exactly like the lecture content style."
+            )
+    return ""  # English or other subjects — no special instruction
+
+
 async def _handle_basic_doubt(
     db: AsyncSession,
     tenant_id: UUID,
@@ -671,17 +913,19 @@ async def _handle_basic_doubt(
     chat_id: Optional[UUID],
 ) -> Tuple[AIDoubtChat, AIDoubtMessage]:
     chunks = await get_similar_chunks(db, tenant_id, lecture_id, message, limit=5)
-    context = "\n\n".join(chunks)
+    context = limit_context(chunks)
+    lang_instruction = _language_instruction(subject_name)
     system_prompt = (
         f"You are a helpful teacher assistant for {subject_name}, topic: {topic_name}. "
         "Answer the student's question ONLY using the lecture content provided below. "
         f"If the answer is not in the lecture content, respond with: "
         f"'This was not covered in today's lecture on {topic_name}.' "
-        "Keep answers clear, simple, and encouraging. Do not go beyond the lecture content."
+        "Keep answers clear, simple, and encouraging. Do not go beyond the lecture content. "
+        + (lang_instruction if lang_instruction else "")
     )
     try:
         response = await client.chat.completions.create(
-            model="gpt-4o",
+            model=MODEL_BASIC,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Lecture content:\n\n{context}\n\n\nStudent question: {message}"},
@@ -716,8 +960,9 @@ async def _handle_pro_doubt(
     message_type: str,
 ) -> Tuple[AIDoubtChat, AIDoubtMessage]:
     chunks = await get_similar_chunks(db, tenant_id, lecture_id, message, limit=5)
-    context = "\n\n".join(chunks)
+    context = limit_context(chunks)
     history = await get_chat_history(db, chat_id) if chat_id else []
+    lang_instruction = _language_instruction(subject_name)
     if message_type == "QUESTION":
         system_prompt = (
             f"You are an expert teacher for {subject_name}, topic: {topic_name}. "
@@ -726,7 +971,8 @@ async def _handle_pro_doubt(
             "Format it exactly as: 'Quick check: [your question]' "
             f"Lecture content:\n{context}\n\nRules: "
             "Answer only from lecture content. "
-            "Comprehension question must be about what you just explained. Be encouraging and clear."
+            "Comprehension question must be about what you just explained. Be encouraging and clear. "
+            + (lang_instruction if lang_instruction else "")
         )
     else:
         system_prompt = (
@@ -737,7 +983,8 @@ async def _handle_pro_doubt(
             "STEP 2B: If WRONG or INCOMPLETE → Gently say it is not quite right; "
             "Re-explain using a DIFFERENT approach (use analogy, real example, or simpler breakdown); "
             "Ask the same comprehension question again but phrased differently. "
-            f"Lecture content:\n{context}"
+            f"Lecture content:\n{context} "
+            + (lang_instruction if lang_instruction else "")
         )
     messages = [{"role": "system", "content": system_prompt}]
     for h in history:
@@ -745,7 +992,7 @@ async def _handle_pro_doubt(
     messages.append({"role": "user", "content": message})
     try:
         response = await client.chat.completions.create(
-            model="gpt-4o",
+            model=MODEL_PRO,
             messages=messages,
             temperature=0.7,
         )
@@ -777,9 +1024,10 @@ async def _handle_ultra_doubt(
     session_stage: str,
 ) -> Tuple[AIDoubtChat, AIDoubtMessage]:
     chunks = await get_similar_chunks(db, tenant_id, lecture_id, topic_name, limit=5)
-    context = "\n\n".join(chunks)
+    context = limit_context(chunks)
     history_raw = await get_chat_history(db, chat_id) if chat_id else []
     history = history_raw[-10:]  # last 10 messages
+    lang_instruction = _language_instruction(subject_name)
     stage_prompts = {
         "START": (
             f"You are an elite IIT-level mentor for {subject_name}. Today's topic: {topic_name}. "
@@ -824,6 +1072,8 @@ async def _handle_ultra_doubt(
         ),
     }
     system_prompt = stage_prompts.get(session_stage, stage_prompts["START"])
+    if lang_instruction:
+        system_prompt += " " + lang_instruction
     messages = [{"role": "system", "content": system_prompt}]
     for h in history:
         messages.append({"role": h["role"], "content": h["content"]})
@@ -831,7 +1081,7 @@ async def _handle_ultra_doubt(
         messages.append({"role": "user", "content": message})
     try:
         response = await client.chat.completions.create(
-            model="gpt-4o",
+            model=MODEL_ULTRA,
             messages=messages,
             temperature=0.8,
         )
@@ -864,13 +1114,15 @@ async def _stream_basic_doubt(
 ) -> AsyncGenerator[dict, None]:
     """Stream BASIC tier doubt response as SSE-style events."""
     chunks = await get_similar_chunks(db, tenant_id, lecture_id, message, limit=5)
-    context = "\n\n".join(chunks)
+    context = limit_context(chunks)
+    lang_instruction = _language_instruction(subject_name)
     system_prompt = (
         f"You are a helpful teacher assistant for {subject_name}, topic: {topic_name}. "
         "Answer the student's question ONLY using the lecture content provided below. "
         f"If the answer is not in the lecture content, respond with: "
         f"'This was not covered in today's lecture on {topic_name}.' "
-        "Keep answers clear, simple, and encouraging. Do not go beyond the lecture content."
+        "Keep answers clear, simple, and encouraging. Do not go beyond the lecture content. "
+        + (lang_instruction if lang_instruction else "")
     )
     messages = [
         {"role": "system", "content": system_prompt},
@@ -878,7 +1130,7 @@ async def _stream_basic_doubt(
     ]
     try:
         stream = await client.chat.completions.create(
-            model="gpt-4o",
+            model=MODEL_BASIC,
             messages=messages,
             temperature=0.5,
             stream=True,
@@ -928,9 +1180,10 @@ async def _stream_pro_doubt(
 ) -> AsyncGenerator[dict, None]:
     """Stream PRO tier doubt response as SSE-style events."""
     chunks = await get_similar_chunks(db, tenant_id, lecture_id, message, limit=5)
-    context = "\n\n".join(chunks)
+    context = limit_context(chunks)
     chat_obj = await _get_or_create_doubt_chat(db, tenant_id, user_id, lecture_id, chat_id)
     history = await get_chat_history(db, chat_obj.id)
+    lang_instruction = _language_instruction(subject_name)
     if message_type == "QUESTION":
         system_prompt = (
             f"You are an expert teacher for {subject_name}, topic: {topic_name}. "
@@ -939,7 +1192,8 @@ async def _stream_pro_doubt(
             "Format it exactly as: 'Quick check: [your question]' "
             f"Lecture content:\n{context}\n\nRules: "
             "Answer only from lecture content. "
-            "Comprehension question must be about what you just explained. Be encouraging and clear."
+            "Comprehension question must be about what you just explained. Be encouraging and clear. "
+            + (lang_instruction if lang_instruction else "")
         )
     else:
         system_prompt = (
@@ -950,7 +1204,8 @@ async def _stream_pro_doubt(
             "STEP 2B: If WRONG or INCOMPLETE → Gently say it is not quite right; "
             "Re-explain using a DIFFERENT approach (use analogy, real example, or simpler breakdown); "
             "Ask the same comprehension question again but phrased differently. "
-            f"Lecture content:\n{context}"
+            f"Lecture content:\n{context} "
+            + (lang_instruction if lang_instruction else "")
         )
     messages = [{"role": "system", "content": system_prompt}]
     for h in history:
@@ -958,7 +1213,7 @@ async def _stream_pro_doubt(
     messages.append({"role": "user", "content": message})
     try:
         stream = await client.chat.completions.create(
-            model="gpt-4o",
+            model=MODEL_PRO,
             messages=messages,
             temperature=0.7,
             stream=True,
@@ -1007,10 +1262,11 @@ async def _stream_ultra_doubt(
 ) -> AsyncGenerator[dict, None]:
     """Stream ULTRA tier doubt response as SSE-style events."""
     chunks = await get_similar_chunks(db, tenant_id, lecture_id, topic_name, limit=5)
-    context = "\n\n".join(chunks)
+    context = limit_context(chunks)
     chat_obj = await _get_or_create_doubt_chat(db, tenant_id, user_id, lecture_id, chat_id)
     history_raw = await get_chat_history(db, chat_obj.id)
     history = history_raw[-10:]
+    lang_instruction = _language_instruction(subject_name)
     stage_prompts = {
         "START": (
             f"You are an elite IIT-level mentor for {subject_name}. Today's topic: {topic_name}. "
@@ -1055,6 +1311,8 @@ async def _stream_ultra_doubt(
         ),
     }
     system_prompt = stage_prompts.get(session_stage, stage_prompts["START"])
+    if lang_instruction:
+        system_prompt += " " + lang_instruction
     messages = [{"role": "system", "content": system_prompt}]
     for h in history:
         messages.append({"role": h["role"], "content": h["content"]})
@@ -1062,7 +1320,7 @@ async def _stream_ultra_doubt(
         messages.append({"role": "user", "content": message})
     try:
         stream = await client.chat.completions.create(
-            model="gpt-4o",
+            model=MODEL_ULTRA,
             messages=messages,
             temperature=0.8,
             stream=True,
@@ -1655,8 +1913,7 @@ async def process_lecture_background(session_id: UUID) -> None:
                 },
             )
 
-            audio_bytes = await asyncio.to_thread(lambda: open(audio_path, "rb").read())
-            if not audio_bytes:
+            if not os.path.isfile(audio_path) or os.path.getsize(audio_path) == 0:
                 session.status = "FAILED"
                 session.processing_stage = "ERROR"
                 await db.commit()
@@ -1666,16 +1923,9 @@ async def process_lecture_background(session_id: UUID) -> None:
                 )
                 return
 
-            audio_file = io.BytesIO(audio_bytes)
-            audio_file.name = "lecture.webm"
-
-            transcription = await client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file,
-                response_format="verbose_json",
-            )
-            transcript = transcription if isinstance(transcription, str) else transcription.text
-            logger.info("Whisper raw transcript (recording pipeline): %s", transcript)
+            # Chunked transcription: 30s slices → faster + cheaper + real-time feel
+            transcript = await transcribe_in_chunks(audio_path, chunk_duration_s=30)
+            logger.info("Chunked transcript (recording pipeline): %d chars", len(transcript))
             session.transcript = transcript
             session.processing_stage = "CHUNKING"
             session.upload_progress_percent = max(session.upload_progress_percent or 0, 40)

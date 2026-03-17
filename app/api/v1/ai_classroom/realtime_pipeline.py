@@ -15,7 +15,7 @@ from app.core.models import AILectureChunk, AILectureSession
 from app.db.session import AsyncSessionLocal
 
 from .audio_buffer_manager import buffer_manager
-from .service import chunk_text, generate_embeddings_batch
+from .service import MULTILINGUAL_PROMPT, chunk_text, generate_embeddings_batch, romanize_indian_script
 
 logger = logging.getLogger(__name__)
 
@@ -69,11 +69,13 @@ async def transcribe_chunk(client: AsyncOpenAI, audio_bytes: bytes, *, timeout_s
                 model="whisper-1",
                 file=audio_file,
                 response_format="verbose_json",
-                temperature=0,
+                temperature=0.2,
+                prompt=MULTILINGUAL_PROMPT,
             ),
             timeout=timeout_s,
         )
-        return transcription if isinstance(transcription, str) else (transcription.text or "")
+        raw = transcription if isinstance(transcription, str) else (transcription.text or "")
+        return await romanize_indian_script(raw)
     except (asyncio.TimeoutError, openai.APIError) as e:
         logger.warning("Whisper chunk transcription failed: %s", e)
         return ""
@@ -138,15 +140,19 @@ class RealtimePipelineManager:
             for idx in range(max(1, cfg.workers)):
                 state.tasks.append(asyncio.create_task(self._worker(session_id, idx, cfg)))
 
-    async def stop(self, session_id: UUID, *, drain_timeout_s: float = 20.0) -> None:
+    async def stop(self, session_id: UUID, *, drain_timeout_s: float = 20.0, whisper_timeout_s: float = 35.0) -> None:
         state = self._states.get(session_id)
         if not state:
             return
+        # Compute timeout: enough for all queued items + the one currently being processed
+        pending = state.queue.qsize() + 1  # +1 for item currently in-flight
+        effective_timeout = max(drain_timeout_s, pending * (whisper_timeout_s + 5.0))
+        logger.info("Draining pipeline for session %s: %d pending items, timeout=%.1fs", session_id, pending, effective_timeout)
         state.stop_event.set()
         try:
-            await asyncio.wait_for(state.queue.join(), timeout=drain_timeout_s)
+            await asyncio.wait_for(state.queue.join(), timeout=effective_timeout)
         except asyncio.TimeoutError:
-            pass
+            logger.warning("Pipeline drain timed out for session %s after %.1fs (%d items may be lost)", session_id, effective_timeout, state.queue.qsize())
         for t in state.tasks:
             t.cancel()
         await asyncio.gather(*state.tasks, return_exceptions=True)
@@ -212,8 +218,15 @@ class RealtimePipelineManager:
 
     async def _worker(self, session_id: UUID, worker_idx: int, cfg: RealtimeConfig) -> None:
         state = self._states[session_id]
-        while not state.stop_event.is_set():
-            audio_bytes = await state.queue.get()
+        while True:
+            # Keep draining the queue even after stop_event — exit only when queue is empty AND stopped
+            try:
+                audio_bytes = await asyncio.wait_for(state.queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                if state.stop_event.is_set():
+                    break
+                continue
+
             started = time.time()
             try:
                 await state.limiter.wait()
