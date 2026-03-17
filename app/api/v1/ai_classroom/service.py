@@ -1,18 +1,18 @@
 """AI Classroom service with transcription, embedding, RAG, and management chat."""
-
 import asyncio
 import io
 import logging
+import os
+import subprocess
+import tempfile
 from datetime import datetime, timezone
 from typing import AsyncGenerator, Iterable, List, Optional, Tuple
 from uuid import UUID
-
 import openai
 from fastapi import HTTPException, UploadFile, status
 from openai import AsyncOpenAI
 from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.auth.models import User
 from app.auth.schemas import CurrentUser
 from app.core.config import settings
@@ -39,6 +39,7 @@ from .schemas import (
 )
 
 client = AsyncOpenAI(api_key=settings.openai_api_key)
+logger = logging.getLogger(__name__)
 
 
 def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
@@ -70,42 +71,110 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]
     return [chunk for chunk in chunks if chunk]
 
 
+def clean_audio(input_path: str) -> str:
+    """
+    Preprocess audio with FFmpeg: highpass/lowpass/afftdn, then convert to mono 16kHz WAV.
+    Returns path to the cleaned .wav file (caller must delete it).
+    """
+    fd, output_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    try:
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i", input_path,
+            "-af", "highpass=f=200,lowpass=f=3500,afftdn=nf=-25",
+            "-ar", "16000",
+            "-ac", "1",
+            output_path,
+        ]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode != 0:
+            raise ServiceError(
+                f"FFmpeg failed: {result.stderr or result.stdout or 'unknown error'}",
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        return output_path
+    except subprocess.TimeoutExpired:
+        if os.path.exists(output_path):
+            try:
+                os.unlink(output_path)
+            except OSError:
+                pass
+        raise ServiceError("FFmpeg timed out", status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except FileNotFoundError:
+        if os.path.exists(output_path):
+            try:
+                os.unlink(output_path)
+            except OSError:
+                pass
+        raise ServiceError("FFmpeg not found; install FFmpeg and ensure it is in PATH", status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
 async def transcribe_audio(file: UploadFile) -> str:
-    """Transcribe audio file using OpenAI Whisper API."""
+    """Transcribe audio: save to temp file → clean with FFmpeg → send cleaned WAV to Whisper."""
     if not file.content_type or not file.content_type.startswith("audio/"):
         raise ServiceError("Invalid file type. Expected audio file.", status.HTTP_400_BAD_REQUEST)
 
+    content_type_map = {
+        "audio/webm": ".webm",
+        "audio/mpeg": ".mp3",
+        "audio/mp3": ".mp3",
+        "audio/wav": ".wav",
+        "audio/x-wav": ".wav",
+        "audio/mp4": ".m4a",
+        "audio/m4a": ".m4a",
+    }
+    suffix = content_type_map.get(file.content_type, ".webm")
+    if file.filename and "." in file.filename:
+        suffix = "." + file.filename.rsplit(".", 1)[-1].lower()
+
+    temp_input_path = None
+    cleaned_path = None
+
     try:
         contents = await file.read()
-        audio_file = io.BytesIO(contents)
-        
-        # 🔥 CRITICAL: Set filename - OpenAI uses this to infer format
-        if file.filename:
-            audio_file.name = file.filename
-        else:
-            # Infer from content_type or default to webm
-            content_type_map = {
-                "audio/webm": "audio.webm",
-                "audio/mpeg": "audio.mp3",
-                "audio/mp3": "audio.mp3",
-                "audio/wav": "audio.wav",
-                "audio/x-wav": "audio.wav",
-                "audio/mp4": "audio.m4a",
-                "audio/m4a": "audio.m4a",
-            }
-            audio_file.name = content_type_map.get(file.content_type, "audio.webm")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(contents)
+            temp_input_path = tmp.name
+
+        cleaned_path = await asyncio.to_thread(clean_audio, temp_input_path)
+
+        with open(cleaned_path, "rb") as f:
+            audio_file = io.BytesIO(f.read())
+        audio_file.name = "audio.wav"
 
         transcription = await client.audio.transcriptions.create(
             model="whisper-1",
             file=audio_file,
-            response_format="verbose_json"
+            temperature=0,
+            response_format="verbose_json",
         )
-
-        return transcription if isinstance(transcription, str) else transcription.text
+        raw_transcript = transcription if isinstance(transcription, str) else transcription.text
+        logger.info("Whisper raw transcript (upload endpoint): %s", raw_transcript)
+        return raw_transcript
+    except ServiceError:
+        raise
     except openai.APIError as e:
         raise ServiceError(f"OpenAI API error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
     except Exception as e:
         raise ServiceError(f"Transcription error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
+    finally:
+        if temp_input_path and os.path.exists(temp_input_path):
+            try:
+                os.unlink(temp_input_path)
+            except OSError:
+                pass
+        if cleaned_path and os.path.exists(cleaned_path):
+            try:
+                os.unlink(cleaned_path)
+            except OSError:
+                pass
 
 
 async def generate_embedding(text: str) -> List[float]:
@@ -120,30 +189,6 @@ async def generate_embedding(text: str) -> List[float]:
         raise ServiceError(f"OpenAI API error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
     except Exception as e:
         raise ServiceError(f"Embedding generation error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-
-# ---------------------------------------------------------------------------
-# Generic management-knowledge indexing helpers (called from CRUD services)
-# ---------------------------------------------------------------------------
-
-
-def _serialize_student_summary(student: "Student") -> str:  # type: ignore[name-defined]
-    """
-    Turn a student ORM instance into a concise natural-language summary.
-    This is an example; extend as needed for your domain.
-    """
-    parts: List[str] = []
-    if getattr(student, "admission_no", None):
-        parts.append(f"Admission No: {student.admission_no}")
-    parts.append(f"Name: {student.first_name} {getattr(student, 'last_name', '')}".strip())
-    if getattr(student, "class_name", None):
-        parts.append(f"Class: {student.class_name}")
-    if getattr(student, "section_name", None):
-        parts.append(f"Section: {student.section_name}")
-    if getattr(student, "parent_phone", None):
-        parts.append(f"Parent Phone: {student.parent_phone}")
-    return ". ".join(parts)
-
 
 async def index_management_entity(
     db: AsyncSession,
@@ -189,12 +234,6 @@ async def bulk_index_management_entities(
     """
     for entity_id, content in items:
         await index_management_entity(db, tenant_id, entity_type, entity_id, content)
-
-
-# ---------------------------------------------------------------------------
-# Organization-wide management chat (role-based, vector-backed, SSE)
-# ---------------------------------------------------------------------------
-
 
 def _resolve_allowed_entity_types(current_user: CurrentUser) -> List[str]:
     """
@@ -342,7 +381,7 @@ async def management_chat_stream(
     except Exception as e:
         raise ServiceError(f"Error generating management answer: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    # For now we do not persist chat history; this can be added later.
+ 
     yield {"type": "done"}
 
 
@@ -392,7 +431,6 @@ async def create_lecture(
         title=payload.title,
         transcript=transcript,
     )
-
     db.add(lecture)
     await db.flush()
 
@@ -1608,9 +1646,10 @@ async def process_lecture_background(session_id: UUID) -> None:
             transcription = await client.audio.transcriptions.create(
                 model="whisper-1",
                 file=audio_file,
-                response_format="verbose_json"
+                response_format="verbose_json",
             )
             transcript = transcription if isinstance(transcription, str) else transcription.text
+            logger.info("Whisper raw transcript (recording pipeline): %s", transcript)
             session.transcript = transcript
             session.processing_stage = "CHUNKING"
             session.upload_progress_percent = max(session.upload_progress_percent or 0, 40)
