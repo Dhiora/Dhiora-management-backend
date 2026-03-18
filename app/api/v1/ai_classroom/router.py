@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 from typing import List, Optional
 from uuid import UUID
 
@@ -589,23 +590,47 @@ async def websocket_stream(
     """
     WebSocket for live audio chunk streaming during recording.
 
-    - Receives bytes frames only (audio chunks)
-    - Buffers chunks in memory (bytearray) and flushes to disk when >= 5MB
-    - On client disconnect (stop recording), flushes remaining buffer, marks session PROCESSING,
-      and triggers background processing (transcription + embeddings).
+    PRIMARY: realtime chunk pipeline (transcribe + embed + RAG while recording).
+    FALLBACK: file-based buffering + batch processing.
     """
     import logging
     from datetime import datetime, timezone
 
     from app.db.session import AsyncSessionLocal
     from app.api.v1.ai_classroom.audio_buffer_manager import buffer_manager
+    from app.api.v1.ai_classroom.realtime_pipeline import RealtimeConfig, realtime_pipeline
+    from app.core.config import settings
 
     logger = logging.getLogger(__name__)
     await websocket.accept()
 
-    file_path = f"{UPLOAD_DIR}/lecture_{session_id}.webm"
-    f = None
-    FLUSH_THRESHOLD_BYTES = 5 * 1024 * 1024  # 5MB
+    real_cfg = RealtimeConfig(
+        enabled=bool(settings.ai_realtime_enabled),
+        max_frame_bytes=int(settings.ai_realtime_max_frame_bytes),
+        target_chunk_bytes=int(settings.ai_realtime_target_chunk_bytes),
+        min_chunk_bytes=int(settings.ai_realtime_min_chunk_bytes),
+        max_chunk_bytes=int(settings.ai_realtime_max_chunk_bytes),
+        overlap_bytes=int(settings.ai_realtime_overlap_bytes),
+        max_buffer_size_bytes=int(settings.ai_realtime_max_buffer_size_bytes),
+        max_queue_size=int(settings.ai_realtime_max_queue_size),
+        workers=int(settings.ai_realtime_workers),
+        whisper_timeout_s=float(settings.ai_realtime_whisper_timeout_s),
+        whisper_rps_limit=float(settings.ai_realtime_whisper_rps_limit),
+        enable_adaptive_chunking=bool(settings.ai_realtime_enable_adaptive_chunking),
+        lag_soft_ms=int(settings.ai_realtime_lag_soft_ms),
+        lag_hard_ms=int(settings.ai_realtime_lag_hard_ms),
+        buffer_health_every_n_frames=int(settings.ai_realtime_buffer_health_every_n_frames),
+    )
+
+    send_lock = asyncio.Lock()
+
+    async def _safe_send(payload: dict) -> None:
+        try:
+            async with send_lock:
+                await websocket.send_json(payload)
+        except Exception:
+            # Never crash receive loop because client is gone
+            pass
 
     async with AsyncSessionLocal() as db:
         try:
@@ -641,11 +666,32 @@ async def websocket_stream(
                 "status": "connected",
                 "session_id": str(session_id),
                 "message": "Send audio as binary WebSocket frames. Close the socket to stop & finalize.",
+                "real_time_enabled": bool(real_cfg.enabled),
             })
 
-            await buffer_manager.initialize(session_id)
-            # Keep file handle open to minimize disk I/O overhead
-            f = open(file_path, "ab")
+            if real_cfg.enabled:
+                await buffer_manager.initialize(
+                    session_id,
+                    target_chunk_bytes=real_cfg.target_chunk_bytes,
+                    overlap_bytes=real_cfg.overlap_bytes,
+                    max_buffer_size_bytes=real_cfg.max_buffer_size_bytes,
+                )
+                await realtime_pipeline.start(session_id, _safe_send, real_cfg)
+                await _safe_send({"type": "processing_status", "stage": "STREAMING"})
+            else:
+                # Fallback: write incoming audio to disk in chunks
+                file_path = f"{UPLOAD_DIR}/lecture_{session_id}.webm"
+                f = await asyncio.to_thread(open, file_path, "ab")
+                FLUSH_THRESHOLD_BYTES = 5 * 1024 * 1024  # 5MB
+                await buffer_manager.initialize(
+                    session_id,
+                    target_chunk_bytes=FLUSH_THRESHOLD_BYTES,
+                    overlap_bytes=0,
+                    max_buffer_size_bytes=FLUSH_THRESHOLD_BYTES,
+                )
+
+            frames_seen = 0
+            last_health_send = 0.0
 
             while True:
                 try:
@@ -663,23 +709,69 @@ async def websocket_stream(
                     # Only process binary frames as audio; ignore text frames (no KeyError).
                     audio_bytes = message.get("bytes")
                     if audio_bytes and len(audio_bytes) > 0:
-                        await buffer_manager.append_chunk(session_id, audio_bytes)
+                        if len(audio_bytes) > real_cfg.max_frame_bytes:
+                            # Drop oversized frames to prevent spikes
+                            await _safe_send({"type": "buffer_health", "dropped": len(audio_bytes), "reason": "frame_too_large"})
+                            continue
 
-                        # Flush to disk only when threshold reached
-                        if await buffer_manager.should_flush(session_id, FLUSH_THRESHOLD_BYTES):
-                            data_to_write = await buffer_manager.pop_all(session_id)
-                            if data_to_write:
-                                f.write(data_to_write)
-                                f.flush()
+                        frames_seen += 1
+                        await buffer_manager.append(session_id, audio_bytes)
 
-                        # Lightweight session heartbeat (optional)
-                        session = await service.get_recording_session(
-                            db, current_user.tenant_id, session_id, teacher_id=current_user.id
-                        )
-                        if session and session.status in ("RECORDING", "PAUSED", "STOPPING"):
-                            session.last_chunk_received_at = datetime.now(timezone.utc)
-                            session.audio_buffer_size_bytes = await buffer_manager.get_size(session_id)
-                            await db.commit()
+                        if real_cfg.enabled:
+                            # Emit chunks without blocking receive loop
+                            emitted = 0
+                            while await buffer_manager.has_ready_chunk(session_id):
+                                chunk = await buffer_manager.pop_ready_chunk(session_id)
+                                if not chunk:
+                                    break
+                                ok = await realtime_pipeline.enqueue(session_id, chunk, real_cfg)
+                                emitted += 1
+                                if not ok:
+                                    break
+
+                            # Adaptive chunk sizing based on lag/queue pressure (cheap heuristic)
+                            if real_cfg.enable_adaptive_chunking:
+                                health = await buffer_manager.health(session_id)
+                                now = time.time()
+                                lag_ms = max(0.0, (now - health.last_emit_ts) * 1000.0) if health.last_emit_ts else 0.0
+                                if lag_ms > real_cfg.lag_hard_ms:
+                                    new_target = max(real_cfg.min_chunk_bytes, int(health.buffer_size_bytes * 0.5))
+                                    await buffer_manager.set_chunk_target(session_id, new_target)
+                                elif lag_ms < real_cfg.lag_soft_ms:
+                                    await buffer_manager.set_chunk_target(session_id, real_cfg.target_chunk_bytes)
+
+                            # Periodic health event
+                            if frames_seen % max(1, real_cfg.buffer_health_every_n_frames) == 0:
+                                health = await buffer_manager.health(session_id)
+                                now = time.time()
+                                if now - last_health_send > 0.4:
+                                    last_health_send = now
+                                    await _safe_send(
+                                        {
+                                            "type": "buffer_health",
+                                            "buffer_size": health.buffer_size_bytes,
+                                            "max_buffer_size": health.max_buffer_size_bytes,
+                                            "dropped_bytes_total": health.dropped_bytes_total,
+                                            "chunks_emitted_total": health.chunks_emitted_total,
+                                        }
+                                    )
+                        else:
+                            # Fallback: flush to disk only when threshold reached
+                            if await buffer_manager.has_ready_chunk(session_id):
+                                data_to_write = await buffer_manager.pop_ready_chunk(session_id)
+                                if data_to_write:
+                                    await asyncio.to_thread(f.write, data_to_write)
+                                    await asyncio.to_thread(f.flush)
+
+                        # Lightweight session heartbeat (do not block too often)
+                        if frames_seen % 10 == 0:
+                            session = await service.get_recording_session(
+                                db, current_user.tenant_id, session_id, teacher_id=current_user.id
+                            )
+                            if session and session.status in ("RECORDING", "PAUSED", "STOPPING"):
+                                session.last_chunk_received_at = datetime.now(timezone.utc)
+                                session.audio_buffer_size_bytes = await buffer_manager.get_size(session_id)
+                                await db.commit()
                     # If "text" in message: client sent a text frame; ignore and keep listening for binary.
 
                 except WebSocketDisconnect:
@@ -696,52 +788,86 @@ async def websocket_stream(
             except Exception:
                 pass
         finally:
-            try:
-                # Flush any remaining buffered data before closing
-                if f is None:
-                    f = open(file_path, "ab")
-                remaining = await buffer_manager.pop_all(session_id)
-                if remaining:
-                    f.write(remaining)
-                    f.flush()
-            except Exception:
-                logger.exception("Failed flushing remaining buffer for session %s", session_id)
-            finally:
+            if real_cfg.enabled:
+                # Drain: emit all ready chunks, then force-flush any remaining partial buffer.
                 try:
-                    if f is not None:
-                        f.close()
+                    while await buffer_manager.has_ready_chunk(session_id):
+                        chunk = await buffer_manager.pop_ready_chunk(session_id)
+                        if not chunk:
+                            break
+                        await realtime_pipeline.enqueue(session_id, chunk, real_cfg)
+                    # Force-flush bytes below target_chunk_bytes (short recordings or tail audio)
+                    remaining = await buffer_manager.pop_remaining(session_id)
+                    if remaining:
+                        await realtime_pipeline.enqueue(session_id, remaining, real_cfg)
                 except Exception:
                     pass
 
-            # After all audio has been written, mark session PROCESSING and start background task.
-            try:
-                session = await service.get_recording_session(
-                    db, current_user.tenant_id, session_id, teacher_id=current_user.id
-                )
-                if session and session.status in ("RECORDING", "PAUSED", "STOPPING"):
-                    session.audio_file_path = file_path
-                    session.upload_completed = True
-                    session.status = "PROCESSING"
-                    session.processing_stage = "TRANSCRIBING"
-                    session.upload_progress_percent = max(getattr(session, "upload_progress_percent", 0) or 0, 10)
-                    await db.commit()
-
-                    from app.core.websocket import connection_manager
-
-                    # Notify UI that processing has started
-                    await connection_manager.send_to_channel(
-                        connection_manager.channel_for_session(str(session_id)),
-                        {
-                            "status": "processing",
-                            "processing_stage": session.processing_stage,
-                            "upload_completed": bool(getattr(session, "upload_completed", False)),
-                            "progress": session.upload_progress_percent,
-                        },
+                # Transition states as per existing lifecycle
+                try:
+                    session = await service.get_recording_session(
+                        db, current_user.tenant_id, session_id, teacher_id=current_user.id
                     )
+                    if session and session.status in ("RECORDING", "PAUSED", "STOPPING"):
+                        session.upload_completed = True
+                        session.status = "PROCESSING"
+                        session.processing_stage = "FINALIZING"
+                        session.upload_progress_percent = 95
+                        await db.commit()
+                        await _safe_send({"type": "processing_status", "stage": "FINALIZING"})
+                except Exception:
+                    logger.exception("Failed to transition session %s to PROCESSING (realtime)", session_id)
 
-                    asyncio.create_task(service.process_lecture_background(session_id))
-            except Exception:
-                logger.exception("Failed to transition session %s to PROCESSING after stream close", session_id)
+                await realtime_pipeline.stop(
+                    session_id,
+                    drain_timeout_s=20.0,
+                    whisper_timeout_s=real_cfg.whisper_timeout_s,
+                )
+
+                try:
+                    session = await service.get_recording_session(
+                        db, current_user.tenant_id, session_id, teacher_id=current_user.id
+                    )
+                    if session:
+                        session.status = "COMPLETED"
+                        session.processing_stage = "DONE"
+                        session.upload_progress_percent = 100
+                        await db.commit()
+                        await _safe_send({"type": "processing_status", "stage": "DONE"})
+                except Exception:
+                    logger.exception("Failed to finalize session %s (realtime)", session_id)
+            else:
+                # Fallback: flush remaining data and run background processor
+                try:
+                    remaining = b""
+                    while await buffer_manager.has_ready_chunk(session_id):
+                        remaining += await buffer_manager.pop_ready_chunk(session_id)
+                    if remaining and f is not None:
+                        await asyncio.to_thread(f.write, remaining)
+                        await asyncio.to_thread(f.flush)
+                except Exception:
+                    logger.exception("Failed flushing remaining buffer for session %s (fallback)", session_id)
+                finally:
+                    try:
+                        if f is not None:
+                            await asyncio.to_thread(f.close)
+                    except Exception:
+                        pass
+
+                try:
+                    session = await service.get_recording_session(
+                        db, current_user.tenant_id, session_id, teacher_id=current_user.id
+                    )
+                    if session and session.status in ("RECORDING", "PAUSED", "STOPPING"):
+                        session.audio_file_path = file_path
+                        session.upload_completed = True
+                        session.status = "PROCESSING"
+                        session.processing_stage = "TRANSCRIBING"
+                        session.upload_progress_percent = max(getattr(session, "upload_progress_percent", 0) or 0, 10)
+                        await db.commit()
+                        asyncio.create_task(service.process_lecture_background(session_id))
+                except Exception:
+                    logger.exception("Failed to transition session %s to PROCESSING after stream close", session_id)
 
             try:
                 await buffer_manager.clear(session_id)
