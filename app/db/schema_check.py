@@ -36,6 +36,10 @@ REQUIRED_TABLES: List[Tuple[str, str]] = [
     ("school", "transport_subscription_plans"),
     ("school", "transport_assignments"),
     ("school", "management_knowledge_chunks"),
+    ("school", "online_assessments"),
+    ("school", "assessment_questions"),
+    ("school", "assessment_attempts"),
+    ("school", "assessment_attempt_answers"),
 ]
 
 
@@ -1682,6 +1686,84 @@ TRANSPORT_ASSIGNMENTS_TABLE: str = """
     );
 """
 
+ONLINE_ASSESSMENTS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.online_assessments (
+        id                  UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id           UUID        NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+        created_by          UUID        REFERENCES auth.users(id) ON DELETE SET NULL,
+        academic_year_id    UUID        NOT NULL REFERENCES core.academic_years(id) ON DELETE RESTRICT,
+        class_id            UUID        NOT NULL REFERENCES core.classes(id) ON DELETE RESTRICT,
+        section_id          UUID        REFERENCES core.sections(id) ON DELETE RESTRICT,
+        subject_id          UUID        REFERENCES school.subjects(id) ON DELETE RESTRICT,
+        title               VARCHAR(255) NOT NULL,
+        description         TEXT,
+        duration_minutes    INTEGER     NOT NULL DEFAULT 30,
+        attempts_allowed    INTEGER     NOT NULL DEFAULT 1,
+        status              VARCHAR(20) NOT NULL DEFAULT 'DRAFT'
+                                CONSTRAINT chk_online_assessment_status
+                                CHECK (status IN ('DRAFT','ACTIVE','UPCOMING','COMPLETED')),
+        due_date            DATE,
+        total_questions     INTEGER     NOT NULL DEFAULT 0,
+        total_marks         INTEGER     NOT NULL DEFAULT 0,
+        created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+"""
+
+ASSESSMENT_QUESTIONS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.assessment_questions (
+        id              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+        assessment_id   UUID        NOT NULL REFERENCES school.online_assessments(id) ON DELETE CASCADE,
+        question_text   TEXT        NOT NULL,
+        question_type   VARCHAR(30) NOT NULL DEFAULT 'MCQ'
+                            CONSTRAINT chk_assessment_question_type
+                            CHECK (question_type IN ('MCQ','FILL_IN_BLANK','MULTI_SELECT','SHORT_ANSWER','LONG_ANSWER')),
+        options         JSONB,
+        correct_answer  JSONB,
+        marks           INTEGER     NOT NULL DEFAULT 1,
+        difficulty      VARCHAR(10)
+                            CONSTRAINT chk_assessment_question_difficulty
+                            CHECK (difficulty IN ('easy','medium','hard')),
+        order_index     INTEGER     NOT NULL DEFAULT 0,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+"""
+
+ASSESSMENT_ATTEMPTS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.assessment_attempts (
+        id                  UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+        assessment_id       UUID        NOT NULL REFERENCES school.online_assessments(id) ON DELETE CASCADE,
+        student_id          UUID        NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+        attempt_number      INTEGER     NOT NULL DEFAULT 1,
+        status              VARCHAR(20) NOT NULL DEFAULT 'IN_PROGRESS'
+                                CONSTRAINT chk_assessment_attempt_status
+                                CHECK (status IN ('IN_PROGRESS','SUBMITTED','ABORTED','TIMED_OUT')),
+        score               INTEGER,
+        total_marks         INTEGER,
+        correct_count       INTEGER,
+        wrong_count         INTEGER,
+        skipped_count       INTEGER,
+        time_taken_seconds  INTEGER,
+        started_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        submitted_at        TIMESTAMPTZ,
+        created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_assessment_attempt_number UNIQUE (assessment_id, student_id, attempt_number)
+    );
+"""
+
+ASSESSMENT_ATTEMPT_ANSWERS_TABLE: str = """
+    CREATE TABLE IF NOT EXISTS school.assessment_attempt_answers (
+        id              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+        attempt_id      UUID        NOT NULL REFERENCES school.assessment_attempts(id) ON DELETE CASCADE,
+        question_id     UUID        NOT NULL REFERENCES school.assessment_questions(id) ON DELETE CASCADE,
+        selected_answer JSONB,
+        is_correct      BOOLEAN,
+        marks_awarded   INTEGER,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_attempt_question_answer UNIQUE (attempt_id, question_id)
+    );
+"""
+
 HOLIDAY_CALENDAR_TABLE: str = """
     CREATE TABLE IF NOT EXISTS school.holiday_calendar (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1940,6 +2022,19 @@ async def ensure_tables(db_engine: AsyncEngine) -> None:
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_transport_assignments_vehicle ON school.transport_assignments(vehicle_id)"))
         await conn.execute(text(HOLIDAY_CALENDAR_TABLE))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_holiday_calendar_tenant_ay_month ON school.holiday_calendar(tenant_id, academic_year_id, month)"))
+        # Online Assessment tables
+        await conn.execute(text(ONLINE_ASSESSMENTS_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_online_assessments_tenant_id ON school.online_assessments(tenant_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_online_assessments_academic_year ON school.online_assessments(academic_year_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_online_assessments_class_section ON school.online_assessments(class_id, section_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_online_assessments_status ON school.online_assessments(status)"))
+        await conn.execute(text(ASSESSMENT_QUESTIONS_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_assessment_questions_assessment_id ON school.assessment_questions(assessment_id)"))
+        await conn.execute(text(ASSESSMENT_ATTEMPTS_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_assessment_attempts_assessment_id ON school.assessment_attempts(assessment_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_assessment_attempts_student_id ON school.assessment_attempts(student_id)"))
+        await conn.execute(text(ASSESSMENT_ATTEMPT_ANSWERS_TABLE))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_assessment_attempt_answers_attempt_id ON school.assessment_attempt_answers(attempt_id)"))
 
     # Backfill student_academic_records from existing student_profiles (class_id, section_id)
     # Idempotent: only inserts if no record exists for (student_id, current_academic_year_id)

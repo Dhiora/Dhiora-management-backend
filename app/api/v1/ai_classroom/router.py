@@ -692,12 +692,37 @@ async def websocket_stream(
 
             frames_seen = 0
             last_health_send = 0.0
+            # How long to wait on receive() before checking session status.
+            # Short enough to detect STOPPING quickly; long enough to not spam DB.
+            RECEIVE_IDLE_TIMEOUT_S = 2.0
 
             while True:
                 try:
-                    # Use receive() so we can handle both binary (audio) and text frames without KeyError.
-                    # receive_bytes() raises when client sends a text frame (e.g. ping/JSON).
-                    message = await websocket.receive()
+                    # Use a timeout so that if the frontend stops sending frames (e.g. after
+                    # calling POST /recording/stop) but doesn't immediately close the WebSocket,
+                    # we can detect the STOPPING status and break cleanly rather than hanging
+                    # forever at `await websocket.receive()`.
+                    try:
+                        message = await asyncio.wait_for(
+                            websocket.receive(), timeout=RECEIVE_IDLE_TIMEOUT_S
+                        )
+                    except asyncio.TimeoutError:
+                        # No frame arrived — check whether the frontend has requested stop.
+                        try:
+                            current_session = await service.get_recording_session(
+                                db, current_user.tenant_id, session_id, teacher_id=current_user.id
+                            )
+                            if current_session and current_session.status == "STOPPING":
+                                # Frontend stopped sending; proceed to finalize.
+                                logger.info(
+                                    "Session %s is STOPPING and no audio received for %.1fs — finalizing.",
+                                    session_id, RECEIVE_IDLE_TIMEOUT_S,
+                                )
+                                break
+                        except Exception:
+                            pass
+                        continue
+
                     msg_type = message.get("type")
 
                     if msg_type == "websocket.disconnect":
@@ -706,7 +731,25 @@ async def websocket_stream(
                     if msg_type != "websocket.receive":
                         continue
 
-                    # Only process binary frames as audio; ignore text frames (no KeyError).
+                    # Handle text frames: check for end-of-stream signal from the frontend.
+                    # Frontend should send {"type": "end_of_stream"} when it has finished
+                    # sending all audio chunks and wants the backend to finalize.
+                    text_data = message.get("text")
+                    if text_data:
+                        try:
+                            ctrl = json.loads(text_data)
+                            if ctrl.get("type") in ("end_of_stream", "stop_stream"):
+                                logger.info(
+                                    "Session %s received end_of_stream signal — finalizing.",
+                                    session_id,
+                                )
+                                break
+                        except (json.JSONDecodeError, Exception):
+                            pass
+                        # Any other text frame: ignore and keep listening for audio.
+                        continue
+
+                    # Binary frame: process as audio.
                     audio_bytes = message.get("bytes")
                     if audio_bytes and len(audio_bytes) > 0:
                         if len(audio_bytes) > real_cfg.max_frame_bytes:
@@ -719,14 +762,14 @@ async def websocket_stream(
 
                         if real_cfg.enabled:
                             # Emit chunks without blocking receive loop
-                            emitted = 0
                             while await buffer_manager.has_ready_chunk(session_id):
                                 chunk = await buffer_manager.pop_ready_chunk(session_id)
                                 if not chunk:
                                     break
                                 ok = await realtime_pipeline.enqueue(session_id, chunk, real_cfg)
-                                emitted += 1
                                 if not ok:
+                                    # Queue full and drop occurred; remaining ready chunks stay
+                                    # in buffer_manager and will be flushed on finalization.
                                     break
 
                             # Adaptive chunk sizing based on lag/queue pressure (cheap heuristic)
@@ -772,13 +815,15 @@ async def websocket_stream(
                                 session.last_chunk_received_at = datetime.now(timezone.utc)
                                 session.audio_buffer_size_bytes = await buffer_manager.get_size(session_id)
                                 await db.commit()
-                    # If "text" in message: client sent a text frame; ignore and keep listening for binary.
 
                 except WebSocketDisconnect:
                     break
                 except Exception as e:
                     logger.exception("WebSocket stream error")
-                    await websocket.send_json({"error": f"Processing error: {str(e)}"})
+                    try:
+                        await websocket.send_json({"error": f"Processing error: {str(e)}"})
+                    except Exception:
+                        pass
                     break
 
         except Exception as e:

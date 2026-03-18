@@ -62,6 +62,12 @@ from app.core.models.exam_type import ExamType
 from app.core.models.exam import Exam
 from app.core.models.exam_schedule import ExamSchedule
 from app.core.models.holiday_calendar import HolidayCalendar
+from app.core.models.online_assessment import (
+    OnlineAssessment,
+    AssessmentQuestion,
+    AssessmentAttempt,
+    AssessmentAttemptAnswer,
+)
 
 __all__ = [
     "AcademicYear",
@@ -126,5 +132,9 @@ __all__ = [
     "Exam",
     "ExamSchedule",
     "HolidayCalendar",
+    "OnlineAssessment",
+    "AssessmentQuestion",
+    "AssessmentAttempt",
+    "AssessmentAttemptAnswer",
 ]
 
