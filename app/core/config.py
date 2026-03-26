@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     razorpay_key_id: Optional[str] = Field(None, alias="RAZORPAY_KEY_ID")
     razorpay_key_secret: Optional[str] = Field(None, alias="RAZORPAY_KEY_SECRET")
 
+    redis_url: str = Field("redis://localhost:6379/0", alias="REDIS_URL")
+    redis_cache_ttl_seconds: int = Field(300, alias="REDIS_CACHE_TTL_SECONDS")
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

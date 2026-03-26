@@ -27,6 +27,7 @@ from .schemas import (
     AddCustomStudentFeeRequest,
     AssignTemplateFeesRequest,
     ClassFeeStructureCreate,
+    ClassFeeStructureUpdate,
     ClassFeeStructureResponse,
     ClassFeeStructureByClassResponse,
     ClassFeeStructureItem,
@@ -76,13 +77,19 @@ async def _log_fee_audit(
 
 
 # --- Class Fee Structure ---
-def _cfs_to_response(cfs: ClassFeeStructure) -> ClassFeeStructureResponse:
+def _cfs_to_response(
+    cfs: ClassFeeStructure,
+    class_name: Optional[str] = None,
+    fee_component_name: Optional[str] = None,
+) -> ClassFeeStructureResponse:
     return ClassFeeStructureResponse(
         id=_to_uuid(cfs.id),
         tenant_id=_to_uuid(cfs.tenant_id),
         academic_year_id=_to_uuid(cfs.academic_year_id),
         class_id=_to_uuid(cfs.class_id),
+        class_name=class_name,
         fee_component_id=_to_uuid(cfs.fee_component_id),
+        fee_component_name=fee_component_name,
         amount=_to_decimal(cfs.amount),
         frequency=cfs.frequency,
         due_date=cfs.due_date,
@@ -131,7 +138,11 @@ async def create_class_fee_structure(
         )
         await db.commit()
         await db.refresh(cfs)
-        return _cfs_to_response(cfs)
+        return _cfs_to_response(
+            cfs,
+            class_name=getattr(cl, "name", None),
+            fee_component_name=getattr(fc, "name", None),
+        )
     except IntegrityError:
         await db.rollback()
         raise ServiceError(
@@ -146,16 +157,29 @@ async def list_class_fee_structures(
     academic_year_id: UUID,
     class_id: Optional[UUID] = None,
 ) -> List[ClassFeeStructureResponse]:
-    stmt = select(ClassFeeStructure).where(
-        ClassFeeStructure.tenant_id == tenant_id,
-        ClassFeeStructure.academic_year_id == academic_year_id,
-        ClassFeeStructure.is_active.is_(True),
+    stmt = (
+        select(
+            ClassFeeStructure,
+            SchoolClass.name.label("class_name"),
+            FeeComponent.name.label("fee_component_name"),
+        )
+        .join(SchoolClass, ClassFeeStructure.class_id == SchoolClass.id)
+        .join(FeeComponent, ClassFeeStructure.fee_component_id == FeeComponent.id)
+        .where(
+            ClassFeeStructure.tenant_id == tenant_id,
+            ClassFeeStructure.academic_year_id == academic_year_id,
+            ClassFeeStructure.is_active.is_(True),
+        )
     )
     if class_id is not None:
         stmt = stmt.where(ClassFeeStructure.class_id == class_id)
-    stmt = stmt.order_by(ClassFeeStructure.class_id, ClassFeeStructure.fee_component_id)
+    stmt = stmt.order_by(SchoolClass.name, FeeComponent.name)
     result = await db.execute(stmt)
-    return [_cfs_to_response(c) for c in result.scalars().all()]
+    rows = result.all()
+    return [
+        _cfs_to_response(cfs, class_name=cl_name, fee_component_name=fc_name)
+        for cfs, cl_name, fc_name in rows
+    ]
 
 
 async def list_all_class_fees(
@@ -215,6 +239,124 @@ async def list_all_class_fees(
         )
 
     return list(grouped.values())
+
+
+async def update_class_fee_structure(
+    db: AsyncSession,
+    tenant_id: UUID,
+    class_fee_structure_id: UUID,
+    payload: ClassFeeStructureUpdate,
+) -> ClassFeeStructureResponse:
+    cfs = (
+        await db.execute(
+            select(ClassFeeStructure).where(
+                ClassFeeStructure.id == class_fee_structure_id,
+                ClassFeeStructure.tenant_id == tenant_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if not cfs:
+        raise ServiceError("Class fee structure not found", status.HTTP_404_NOT_FOUND)
+
+    ay = await db.get(AcademicYear, cfs.academic_year_id)
+    if not ay or ay.tenant_id != tenant_id:
+        raise ServiceError("Invalid academic year", status.HTTP_400_BAD_REQUEST)
+    if ay.status != "ACTIVE":
+        raise ServiceError("Cannot modify fee structure for a CLOSED academic year", status.HTTP_400_BAD_REQUEST)
+
+    old_value = {
+        "amount": str(cfs.amount),
+        "frequency": cfs.frequency,
+        "due_date": cfs.due_date.isoformat() if cfs.due_date else None,
+        "is_mandatory": cfs.is_mandatory,
+        "is_active": cfs.is_active,
+    }
+
+    if payload.amount is not None:
+        cfs.amount = payload.amount
+    if payload.frequency is not None:
+        cfs.frequency = payload.frequency.strip().lower()
+    if payload.due_date is not None:
+        cfs.due_date = payload.due_date
+    if payload.is_mandatory is not None:
+        cfs.is_mandatory = payload.is_mandatory
+    if payload.is_active is not None:
+        cfs.is_active = payload.is_active
+
+    await _log_fee_audit(
+        db,
+        tenant_id,
+        "class_fee_structures",
+        cfs.id,
+        "UPDATE",
+        old_value,
+        {
+            "amount": str(cfs.amount),
+            "frequency": cfs.frequency,
+            "due_date": cfs.due_date.isoformat() if cfs.due_date else None,
+            "is_mandatory": cfs.is_mandatory,
+            "is_active": cfs.is_active,
+        },
+        None,
+    )
+    await db.commit()
+    await db.refresh(cfs)
+
+    cl = await db.get(SchoolClass, cfs.class_id)
+    fc = await db.get(FeeComponent, cfs.fee_component_id)
+    return _cfs_to_response(
+        cfs,
+        class_name=getattr(cl, "name", None),
+        fee_component_name=getattr(fc, "name", None),
+    )
+
+
+async def delete_class_fee_structure(
+    db: AsyncSession,
+    tenant_id: UUID,
+    class_fee_structure_id: UUID,
+) -> ClassFeeStructureResponse:
+    cfs = (
+        await db.execute(
+            select(ClassFeeStructure).where(
+                ClassFeeStructure.id == class_fee_structure_id,
+                ClassFeeStructure.tenant_id == tenant_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if not cfs:
+        raise ServiceError("Class fee structure not found", status.HTTP_404_NOT_FOUND)
+
+    if not cfs.is_active:
+        cl = await db.get(SchoolClass, cfs.class_id)
+        fc = await db.get(FeeComponent, cfs.fee_component_id)
+        return _cfs_to_response(
+            cfs,
+            class_name=getattr(cl, "name", None),
+            fee_component_name=getattr(fc, "name", None),
+        )
+
+    cfs.is_active = False
+    await _log_fee_audit(
+        db,
+        tenant_id,
+        "class_fee_structures",
+        cfs.id,
+        "DEACTIVATE",
+        {"is_active": True},
+        {"is_active": False},
+        None,
+    )
+    await db.commit()
+    await db.refresh(cfs)
+
+    cl = await db.get(SchoolClass, cfs.class_id)
+    fc = await db.get(FeeComponent, cfs.fee_component_id)
+    return _cfs_to_response(
+        cfs,
+        class_name=getattr(cl, "name", None),
+        fee_component_name=getattr(fc, "name", None),
+    )
 
 
 # --- Student Fee Assignment ---
@@ -309,7 +451,7 @@ async def assign_template_fees_to_student(
         to_assign.append((optional_map[cid], selected_optional_amounts.get(cid)))
 
     created: List[StudentFeeAssignment] = []
-    async with db.begin():
+    try:
         for cfs, custom_amount in to_assign:
             existing = (
                 await db.execute(
@@ -361,6 +503,10 @@ async def assign_template_fees_to_student(
                 changed_by,
             )
             created.append(sfa)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
 
     for s in created:
         await db.refresh(s)
@@ -433,6 +579,15 @@ async def get_student_fees(
     student_id: UUID,
     academic_year_id: Optional[UUID] = None,
 ) -> List[StudentFeeAssignmentWithDetails]:
+    paid_subq = (
+        select(
+            PaymentTransaction.student_fee_assignment_id.label("assignment_id"),
+            func.coalesce(func.sum(PaymentTransaction.amount_paid), 0).label("amount_paid"),
+        )
+        .where(PaymentTransaction.payment_status == "success")
+        .group_by(PaymentTransaction.student_fee_assignment_id)
+    ).subquery()
+
     class_id_expr = func.coalesce(ClassFeeStructure.class_id, StudentAcademicRecord.class_id)
     stmt = (
         select(
@@ -440,6 +595,7 @@ async def get_student_fees(
             FeeComponent.name.label("fee_component_name"),
             FeeComponent.code.label("fee_component_code"),
             SchoolClass.name.label("class_name"),
+            func.coalesce(paid_subq.c.amount_paid, 0).label("amount_paid"),
         )
         .outerjoin(
             ClassFeeStructure,
@@ -454,6 +610,7 @@ async def get_student_fees(
             ),
         )
         .outerjoin(SchoolClass, SchoolClass.id == class_id_expr)
+        .outerjoin(paid_subq, StudentFeeAssignment.id == paid_subq.c.assignment_id)
         .where(
             StudentFeeAssignment.tenant_id == tenant_id,
             StudentFeeAssignment.student_id == student_id,
@@ -467,10 +624,13 @@ async def get_student_fees(
     rows = result.all()
     out = []
     for row in rows:
-        sfa, fc_name, fc_code, cl_name = row
+        sfa, fc_name, fc_code, cl_name, amount_paid_val = row
         if (sfa.source_type or "").upper() == "CUSTOM":
             fc_name = sfa.custom_name or fc_name
             fc_code = fc_code or None
+        amount_paid = _to_decimal(amount_paid_val)
+        final_amount = _to_decimal(sfa.final_amount)
+        balance = final_amount - amount_paid
         out.append(
             StudentFeeAssignmentWithDetails(
                 id=_to_uuid(sfa.id),
@@ -482,7 +642,7 @@ async def get_student_fees(
                 custom_name=sfa.custom_name,
                 base_amount=_to_decimal(sfa.base_amount),
                 total_discount=_to_decimal(sfa.total_discount),
-                final_amount=_to_decimal(sfa.final_amount),
+                final_amount=final_amount,
                 status=sfa.status,
                 is_active=sfa.is_active,
                 created_at=sfa.created_at,
@@ -490,6 +650,8 @@ async def get_student_fees(
                 fee_component_name=fc_name,
                 fee_component_code=fc_code,
                 class_name=cl_name,
+                amount_paid=amount_paid,
+                balance=balance,
             )
         )
     return out
@@ -827,7 +989,7 @@ async def get_fee_report(
                 )
             )
         ).scalar_one_or_none()
-        section_id = rec[0] if rec else None
+        section_id = rec if rec else None
         section_name = None
         if section_id:
             sec = await db.get(Section, section_id)

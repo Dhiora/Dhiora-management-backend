@@ -59,7 +59,9 @@ class ClassFeeStructureResponse(BaseModel):
     tenant_id: UUID
     academic_year_id: UUID
     class_id: UUID
+    class_name: Optional[str] = None
     fee_component_id: UUID
+    fee_component_name: Optional[str] = None
     amount: Decimal
     frequency: str
     due_date: Optional[date] = None
@@ -114,6 +116,8 @@ class StudentFeeAssignmentWithDetails(StudentFeeAssignmentResponse):
     fee_component_name: Optional[str] = None
     fee_component_code: Optional[str] = None
     class_name: Optional[str] = None
+    amount_paid: Decimal = Decimal("0")
+    balance: Decimal = Decimal("0")
 
 
 # --- Discount ---

@@ -68,6 +68,8 @@ from app.core.models.online_assessment import (
     AssessmentAttempt,
     AssessmentAttemptAnswer,
 )
+from app.core.models.lesson_progress import LessonPlanProgress
+from app.core.models.dashboard_alert import DashboardAlert
 
 __all__ = [
     "AcademicYear",
@@ -136,5 +138,7 @@ __all__ = [
     "AssessmentQuestion",
     "AssessmentAttempt",
     "AssessmentAttemptAnswer",
+    "LessonPlanProgress",
+    "DashboardAlert",
 ]
 

@@ -18,6 +18,7 @@ from .schemas import (
     ClassFeeStructureCreate,
     ClassFeeStructureByClassResponse,
     ClassFeeStructureResponse,
+    ClassFeeStructureUpdate,
     FeeReportItem,
     PaymentCreate,
     PaymentResponse,
@@ -87,6 +88,49 @@ async def list_class_fee_structures(
     return await service.list_class_fee_structures(
         db, current_user.tenant_id, academic_year_id, class_id=class_id
     )
+
+
+@router.patch(
+    "/class/{class_fee_structure_id}",
+    response_model=ClassFeeStructureResponse,
+    dependencies=[
+        Depends(check_permission("fees", "update")),
+        Depends(require_writable_academic_year),
+    ],
+)
+async def update_class_fee_structure(
+    class_fee_structure_id: UUID,
+    payload: ClassFeeStructureUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+) -> ClassFeeStructureResponse:
+    try:
+        return await service.update_class_fee_structure(
+            db, current_user.tenant_id, class_fee_structure_id, payload
+        )
+    except ServiceError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+
+
+@router.delete(
+    "/class/{class_fee_structure_id}",
+    response_model=ClassFeeStructureResponse,
+    dependencies=[
+        Depends(check_permission("fees", "delete")),
+        Depends(require_writable_academic_year),
+    ],
+)
+async def delete_class_fee_structure(
+    class_fee_structure_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+) -> ClassFeeStructureResponse:
+    try:
+        return await service.delete_class_fee_structure(
+            db, current_user.tenant_id, class_fee_structure_id
+        )
+    except ServiceError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
 
 
 # --- Student Fee Assignment ---
