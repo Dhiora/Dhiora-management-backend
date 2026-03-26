@@ -44,7 +44,10 @@ async def create_department(
     dependencies=[Depends(check_permission("departments", "read"))],
 )
 async def list_departments(
-    active_only: bool = Query(True, description="Return only is_active=true by default"),
+    active_only: bool = Query(
+        False,
+        description="Set true to return only active; default returns both active and inactive",
+    ),
     db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ) -> List[DepartmentResponse]:
