@@ -29,4 +29,9 @@ class AILectureChunk(Base):
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
 
     lecture_session = relationship("AILectureSession", back_populates="chunks")
+    images = relationship(
+        "AILectureImage",
+        back_populates="chunk",
+        foreign_keys="AILectureImage.chunk_id",
+    )
 

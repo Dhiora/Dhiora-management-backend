@@ -47,4 +47,5 @@ class AILectureSession(Base):
 
     chunks = relationship("AILectureChunk", back_populates="lecture_session", cascade="all, delete-orphan")
     doubt_chats = relationship("AIDoubtChat", back_populates="lecture_session", cascade="all, delete-orphan")
+    images = relationship("AILectureImage", back_populates="lecture_session", cascade="all, delete-orphan")
 

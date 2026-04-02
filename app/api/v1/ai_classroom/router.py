@@ -25,7 +25,9 @@ from .schemas import (
     DoubtAskResponse,
     DoubtChatResponse,
     DoubtMessageResponse,
+    ImageRegionSchema,
     LectureCreate,
+    LectureImageResponse,
     LectureResponse,
     ManagementChatRequest,
     RecordingStartRequest,
@@ -235,16 +237,21 @@ async def ask_doubt(
     current_user: CurrentUser = Depends(get_current_user),
 ):
     try:
-        chat, ai_message = await service.ask_doubt(
+        chat, ai_message, img_data = await service.ask_doubt(
             db,
             current_user.tenant_id,
             current_user.id,
             payload,
         )
+        highlight = img_data.get("highlight_region")
+        all_regions = img_data.get("all_regions")
         return DoubtAskResponse(
             chat_id=chat.id,
             answer=ai_message.message,
             message=_message_to_response(ai_message),
+            image_url=img_data.get("image_url"),
+            highlight_region=ImageRegionSchema.model_validate(highlight) if highlight else None,
+            all_regions=[ImageRegionSchema.model_validate(r) for r in all_regions] if all_regions else None,
         )
     except ServiceError as e:
         raise HTTPException(status_code=e.status_code, detail=e.message)
@@ -409,6 +416,124 @@ async def list_doubt_chats(
             lecture_id=lecture_id,
         )
         return [_chat_to_response(chat) for chat in chats]
+    except ServiceError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+
+
+def _image_to_response(img) -> LectureImageResponse:
+    return LectureImageResponse(
+        id=img.id,
+        lecture_id=img.lecture_id,
+        chunk_id=img.chunk_id,
+        image_url=img.image_url,
+        sequence_order=img.sequence_order,
+        topic_label=img.topic_label,
+        regions=[
+            ImageRegionSchema(
+                id=r.id,
+                label=r.label,
+                x=r.x,
+                y=r.y,
+                w=r.w,
+                h=r.h,
+                color_hex=r.color_hex or "#EF9F27",
+                description=r.description,
+            )
+            for r in (img.regions or [])
+        ],
+        created_at=img.created_at,
+    )
+
+
+@router.post(
+    "/lectures/{lecture_id}/images",
+    response_model=List[LectureImageResponse],
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(check_permission("ai_classroom", "update_lecture"))],
+)
+async def upload_lecture_images(
+    lecture_id: UUID,
+    image_files: List[UploadFile] = File(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Bulk-upload one or more board images for a lecture.
+    All files are uploaded to S3 and analyzed by GPT-4o vision in parallel.
+    Returns the list of created images with extracted regions.
+    """
+    try:
+        images = await service.upload_and_analyze_images_bulk(
+            db=db,
+            lecture_id=lecture_id,
+            image_files=image_files,
+            tenant_id=current_user.tenant_id,
+            user_id=current_user.id,
+        )
+        return [_image_to_response(img) for img in images]
+    except ServiceError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+
+
+@router.get(
+    "/lectures/{lecture_id}/images",
+    response_model=List[LectureImageResponse],
+    dependencies=[Depends(check_permission("ai_classroom", "read"))],
+)
+async def list_lecture_images(
+    lecture_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """List all board images for a lecture, ordered by sequence."""
+    try:
+        images = await service.list_lecture_images(db, current_user.tenant_id, lecture_id)
+        return [_image_to_response(img) for img in images]
+    except ServiceError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+
+
+@router.get(
+    "/lectures/{lecture_id}/images/{image_id}",
+    response_model=LectureImageResponse,
+    dependencies=[Depends(check_permission("ai_classroom", "read"))],
+)
+async def get_lecture_image(
+    lecture_id: UUID,
+    image_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Get a single lecture board image with its regions."""
+    try:
+        img = await service.get_lecture_image(db, current_user.tenant_id, lecture_id, image_id)
+        if not img:
+            raise ServiceError("Image not found", status.HTTP_404_NOT_FOUND)
+        return _image_to_response(img)
+    except ServiceError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+
+
+@router.delete(
+    "/lectures/{lecture_id}/images/{image_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(check_permission("ai_classroom", "delete_lecture"))],
+)
+async def delete_lecture_image(
+    lecture_id: UUID,
+    image_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Delete a lecture board image and its regions."""
+    try:
+        is_admin = current_user.role in ("SUPER_ADMIN", "PLATFORM_ADMIN", "ADMIN")
+        deleted = await service.delete_lecture_image(
+            db, current_user.tenant_id, current_user.id, lecture_id, image_id, is_admin=is_admin
+        )
+        if not deleted:
+            raise ServiceError("Image not found", status.HTTP_404_NOT_FOUND)
+        return
     except ServiceError as e:
         raise HTTPException(status_code=e.status_code, detail=e.message)
 
@@ -848,12 +973,14 @@ async def websocket_stream(
                 except Exception:
                     pass
 
-                # Transition states as per existing lifecycle
+                # Transition states as per existing lifecycle.
+                # Only finalize if the session was actively recording or stopping —
+                # never touch a PAUSED session so the teacher can resume later.
                 try:
                     session = await service.get_recording_session(
                         db, current_user.tenant_id, session_id, teacher_id=current_user.id
                     )
-                    if session and session.status in ("RECORDING", "PAUSED", "STOPPING"):
+                    if session and session.status in ("RECORDING", "STOPPING"):
                         session.upload_completed = True
                         session.status = "PROCESSING"
                         session.processing_stage = "FINALIZING"
@@ -873,7 +1000,7 @@ async def websocket_stream(
                     session = await service.get_recording_session(
                         db, current_user.tenant_id, session_id, teacher_id=current_user.id
                     )
-                    if session:
+                    if session and session.status == "PROCESSING":
                         session.status = "COMPLETED"
                         session.processing_stage = "DONE"
                         session.upload_progress_percent = 100
@@ -903,7 +1030,9 @@ async def websocket_stream(
                     session = await service.get_recording_session(
                         db, current_user.tenant_id, session_id, teacher_id=current_user.id
                     )
-                    if session and session.status in ("RECORDING", "PAUSED", "STOPPING"):
+                    # Only finalize if actively recording or stopping —
+                    # leave PAUSED sessions untouched so teacher can resume.
+                    if session and session.status in ("RECORDING", "STOPPING"):
                         session.audio_file_path = file_path
                         session.upload_completed = True
                         session.status = "PROCESSING"

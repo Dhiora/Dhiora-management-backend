@@ -1,6 +1,7 @@
 """AI Classroom service with transcription, embedding, RAG, and management chat."""
 import asyncio
 import io
+import json
 import logging
 import os
 import subprocess
@@ -13,6 +14,7 @@ from fastapi import HTTPException, UploadFile, status
 from openai import AsyncOpenAI
 from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 from app.auth.models import User
 from app.auth.schemas import CurrentUser
 from app.core.config import settings
@@ -20,7 +22,9 @@ from app.core.exceptions import ServiceError
 from app.core.models import (
     AIDoubtChat,
     AIDoubtMessage,
+    AIImageRegion,
     AILectureChunk,
+    AILectureImage,
     AILectureSession,
     AcademicYear,
     ManagementKnowledgeChunk,
@@ -46,6 +50,9 @@ MODEL_BASIC   = "gpt-4o-mini"   # cheap, fast — sufficient for simple Q&A
 MODEL_PRO     = "gpt-4o"        # full power for interactive teaching
 MODEL_ULTRA   = "gpt-4o"        # full power for IIT-level mentoring
 MODEL_MGMT    = "gpt-4o-mini"   # management chat — factual retrieval, no deep reasoning needed
+MODEL_VISION  = "gpt-4o"        # vision model for board image region extraction
+
+_REGION_COLORS = ["#EF9F27", "#378ADD", "#1D9E75", "#D4537E", "#7F77DD", "#D85A30"]
 
 _CONTEXT_MAX_CHARS = 2000  # ~500 tokens — covers 3-4 relevant chunks comfortably
 
@@ -415,6 +422,266 @@ async def generate_embeddings_batch(texts: List[str]) -> List[List[float]]:
     except Exception as e:
         raise ServiceError(f"Embedding generation error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+async def analyze_board_image(image_url: str) -> List[dict]:
+    """
+    Send a board/whiteboard image to GPT-4o vision.
+    Returns a list of named regions with normalized coordinates (0.0 to 1.0).
+    Never raises — returns [] on any error.
+    """
+    try:
+        response = await client.chat.completions.create(
+            model=MODEL_VISION,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert at analyzing educational diagrams, machine drawings, "
+                        "math problems, and whiteboard photos. Your job is to identify and locate "
+                        "every distinct labeled component or region in the image."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_url},
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                "Analyze this image carefully. Identify every labeled part, component, "
+                                "symbol, or region visible. For each one return a JSON array with objects: "
+                                '{ "label": string, "x": float, "y": float, "w": float, "h": float, "description": string } '
+                                "where x, y, w, h are fractions of the total image size (0.0 to 1.0). "
+                                "x and y are the TOP-LEFT corner. w and h are width and height. "
+                                "Keep labels short (1-3 words). Return ONLY the JSON array, no other text."
+                            ),
+                        },
+                    ],
+                },
+            ],
+            max_tokens=1000,
+        )
+        raw = response.choices[0].message.content or "[]"
+        # Strip markdown code fences if present
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1]
+            raw = raw.rsplit("```", 1)[0]
+        regions = json.loads(raw)
+        if not isinstance(regions, list):
+            return []
+        cleaned = []
+        for item in regions:
+            if not isinstance(item, dict):
+                continue
+            if not all(k in item for k in ("label", "x", "y", "w", "h")):
+                continue
+            cleaned.append({
+                "label": str(item["label"]),
+                "x": max(0.0, min(1.0, float(item["x"]))),
+                "y": max(0.0, min(1.0, float(item["y"]))),
+                "w": max(0.0, min(1.0, float(item["w"]))),
+                "h": max(0.0, min(1.0, float(item["h"]))),
+                "description": str(item.get("description", "")),
+            })
+        return cleaned
+    except Exception as e:
+        logger.warning("analyze_board_image failed: %s", e)
+        return []
+
+
+async def pick_best_region_for_doubt(question: str, regions: List[dict]) -> Optional[dict]:
+    """
+    Given a student's doubt question and a list of regions, ask GPT-4o-mini to pick
+    the single region most relevant to the question.
+    Returns None if no match or on error.
+    """
+    if not regions:
+        return None
+    try:
+        response = await client.chat.completions.create(
+            model=MODEL_BASIC,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a helpful assistant for students. Given a question and a list "
+                        "of labeled diagram regions, pick the ONE region that best answers or "
+                        "is most relevant to the question."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Question: {question}\n\nRegions: {json.dumps(regions)}\n\n"
+                        "Return ONLY the JSON object of the single best matching region. "
+                        "If no region is relevant, return null."
+                    ),
+                },
+            ],
+            max_tokens=300,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        if raw.lower() == "null" or not raw:
+            return None
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1]
+            raw = raw.rsplit("```", 1)[0]
+        result = json.loads(raw)
+        if isinstance(result, dict) and "label" in result:
+            return result
+        return None
+    except Exception as e:
+        logger.warning("pick_best_region_for_doubt failed: %s", e)
+        return None
+
+
+async def upload_and_analyze_images_bulk(
+    db: AsyncSession,
+    lecture_id: UUID,
+    image_files: List[UploadFile],
+    tenant_id: UUID,
+    user_id: UUID,
+) -> List["AILectureImage"]:
+    """
+    Bulk-upload board images and analyze all with GPT-4o vision in parallel.
+    S3 uploads and vision calls run concurrently; DB writes are sequential.
+    Returns list of AILectureImage ordered by sequence_order.
+    """
+    from app.core.s3 import upload_image_to_s3
+
+    if not image_files:
+        raise ServiceError("No image files provided", status.HTTP_400_BAD_REQUEST)
+
+    lecture = await db.get(AILectureSession, lecture_id)
+    if not lecture or lecture.tenant_id != tenant_id:
+        raise ServiceError("Lecture not found", status.HTTP_404_NOT_FOUND)
+
+    active_statuses = {"RECORDING", "PAUSED", "PROCESSING", "STOPPING"}
+    if lecture.status in active_statuses:
+        raise ServiceError(
+            f"Cannot upload images while lecture is in {lecture.status} state",
+            status.HTTP_400_BAD_REQUEST,
+        )
+
+    # Find current max sequence_order so new images continue from there
+    existing_count_result = await db.execute(
+        select(AILectureImage.sequence_order)
+        .where(
+            AILectureImage.lecture_id == lecture_id,
+            AILectureImage.tenant_id == tenant_id,
+        )
+        .order_by(AILectureImage.sequence_order.desc())
+        .limit(1)
+    )
+    row = existing_count_result.scalar_one_or_none()
+    base_order = (row + 1) if row is not None else 0
+
+    # Step 1: read all file contents into memory
+    file_data = []
+    for f in image_files:
+        contents = await f.read()
+        file_data.append((f.filename or "image.jpg", contents))
+
+    # Step 2: upload all files to S3 in parallel
+    s3_tasks = [
+        upload_image_to_s3(
+            content=contents,
+            filename=filename,
+            tenant_id=str(tenant_id),
+            lecture_id=str(lecture_id),
+        )
+        for filename, contents in file_data
+    ]
+    image_urls = await asyncio.gather(*s3_tasks)
+
+    # Step 3: run GPT-4o vision on all images in parallel
+    vision_tasks = [analyze_board_image(url) for url in image_urls]
+    all_regions_data = await asyncio.gather(*vision_tasks)
+
+    # Step 4: write all DB records sequentially (single session)
+    created_images = []
+    for idx, (image_url, regions_data) in enumerate(zip(image_urls, all_regions_data)):
+        lecture_image = AILectureImage(
+            tenant_id=tenant_id,
+            lecture_id=lecture_id,
+            chunk_id=None,
+            image_url=image_url,
+            sequence_order=base_order + idx,
+            topic_label=None,
+        )
+        db.add(lecture_image)
+        await db.flush()
+
+        for r_idx, region in enumerate(regions_data):
+            color = _REGION_COLORS[r_idx % len(_REGION_COLORS)]
+            db.add(AIImageRegion(
+                lecture_image_id=lecture_image.id,
+                label=region["label"],
+                x=region["x"],
+                y=region["y"],
+                w=region["w"],
+                h=region["h"],
+                color_hex=color,
+                description=region.get("description"),
+            ))
+
+        created_images.append(lecture_image)
+
+    await db.commit()
+
+    # Reload all with regions eagerly
+    ids = [img.id for img in created_images]
+    result = await db.execute(
+        select(AILectureImage)
+        .where(AILectureImage.id.in_(ids))
+        .options(selectinload(AILectureImage.regions))
+        .order_by(AILectureImage.sequence_order)
+    )
+    return list(result.scalars().all())
+
+
+async def _get_lecture_image_for_doubt(
+    db: AsyncSession,
+    tenant_id: UUID,
+    lecture_id: UUID,
+    chunk_ids: Optional[List[UUID]] = None,
+) -> Optional["AILectureImage"]:
+    """
+    Find the best image for a doubt query.
+    First tries images linked to specific chunks, then falls back to any lecture image.
+    """
+    if chunk_ids:
+        result = await db.execute(
+            select(AILectureImage)
+            .where(
+                AILectureImage.lecture_id == lecture_id,
+                AILectureImage.tenant_id == tenant_id,
+                AILectureImage.chunk_id.in_(chunk_ids),
+            )
+            .options(selectinload(AILectureImage.regions))
+            .order_by(AILectureImage.sequence_order)
+            .limit(1)
+        )
+        img = result.scalar_one_or_none()
+        if img:
+            return img
+
+    result = await db.execute(
+        select(AILectureImage)
+        .where(
+            AILectureImage.lecture_id == lecture_id,
+            AILectureImage.tenant_id == tenant_id,
+        )
+        .options(selectinload(AILectureImage.regions))
+        .order_by(AILectureImage.sequence_order)
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
 async def index_management_entity(
     db: AsyncSession,
     tenant_id: UUID,
@@ -687,7 +954,7 @@ async def ask_doubt(
     tenant_id: UUID,
     student_id: UUID,
     payload: DoubtAskRequest,
-) -> Tuple[AIDoubtChat, AIDoubtMessage]:
+) -> Tuple[AIDoubtChat, AIDoubtMessage, dict]:
     """Answer student doubt using RAG."""
     user = await db.get(User, student_id)
     if not user or user.tenant_id != tenant_id:
@@ -780,7 +1047,54 @@ If the answer is not found in the context, politely say that this topic was not 
     await db.refresh(chat_obj)
     await db.refresh(ai_message)
 
-    return chat_obj, ai_message
+    # --- Image annotation lookup (non-critical) ---
+    image_url = None
+    highlight_region = None
+    all_regions = None
+    try:
+        # Fetch chunk IDs for same query (reuse computed embedding_str)
+        chunk_id_result = await db.execute(
+            text("""
+                SELECT id FROM school.ai_lecture_chunks
+                WHERE tenant_id = :tenant_id AND lecture_id = :lecture_id
+                ORDER BY embedding <-> (:question_embedding)::vector
+                LIMIT 5
+            """),
+            {
+                "tenant_id": str(tenant_id),
+                "lecture_id": str(payload.lecture_id),
+                "question_embedding": embedding_str,
+            },
+        )
+        chunk_ids = [row[0] for row in chunk_id_result.fetchall()]
+        lecture_image = await _get_lecture_image_for_doubt(
+            db, tenant_id, payload.lecture_id, chunk_ids=chunk_ids
+        )
+        if lecture_image and lecture_image.regions:
+            image_url = lecture_image.image_url
+            regions_list = [
+                {
+                    "id": str(r.id),
+                    "label": r.label,
+                    "x": r.x, "y": r.y, "w": r.w, "h": r.h,
+                    "color_hex": r.color_hex or "#EF9F27",
+                    "description": r.description,
+                }
+                for r in lecture_image.regions
+            ]
+            all_regions = lecture_image.regions
+            best = await pick_best_region_for_doubt(
+                question=payload.question, regions=regions_list
+            )
+            if best:
+                highlight_region = next(
+                    (r for r in lecture_image.regions if r.label.lower() == best.get("label", "").lower()),
+                    lecture_image.regions[0],
+                )
+    except Exception as e:
+        logger.warning("Image annotation lookup failed in ask_doubt: %s", e)
+
+    return chat_obj, ai_message, {"image_url": image_url, "highlight_region": highlight_region, "all_regions": all_regions}
 
 
 async def get_chat_history(db: AsyncSession, chat_id: UUID) -> List[dict]:
@@ -1115,6 +1429,25 @@ async def _stream_basic_doubt(
     """Stream BASIC tier doubt response as SSE-style events."""
     chunks = await get_similar_chunks(db, tenant_id, lecture_id, message, limit=5)
     context = limit_context(chunks)
+
+    # Emit image annotation event before text streaming (non-critical)
+    try:
+        lecture_image = await _get_lecture_image_for_doubt(db, tenant_id, lecture_id)
+        if lecture_image and lecture_image.regions:
+            regions_list = [
+                {"id": str(r.id), "label": r.label, "x": r.x, "y": r.y,
+                 "w": r.w, "h": r.h, "color_hex": r.color_hex or "#EF9F27", "description": r.description}
+                for r in lecture_image.regions
+            ]
+            best = await pick_best_region_for_doubt(question=message, regions=regions_list)
+            yield {
+                "type": "image_annotation",
+                "image_url": lecture_image.image_url,
+                "highlight_region": best,
+                "all_regions": regions_list,
+            }
+    except Exception as e:
+        logger.warning("Image annotation SSE lookup failed (basic): %s", e)
     lang_instruction = _language_instruction(subject_name)
     system_prompt = (
         f"You are a helpful teacher assistant for {subject_name}, topic: {topic_name}. "
@@ -1181,6 +1514,26 @@ async def _stream_pro_doubt(
     """Stream PRO tier doubt response as SSE-style events."""
     chunks = await get_similar_chunks(db, tenant_id, lecture_id, message, limit=5)
     context = limit_context(chunks)
+
+    # Emit image annotation event before text streaming (non-critical)
+    try:
+        lecture_image = await _get_lecture_image_for_doubt(db, tenant_id, lecture_id)
+        if lecture_image and lecture_image.regions:
+            regions_list = [
+                {"id": str(r.id), "label": r.label, "x": r.x, "y": r.y,
+                 "w": r.w, "h": r.h, "color_hex": r.color_hex or "#EF9F27", "description": r.description}
+                for r in lecture_image.regions
+            ]
+            best = await pick_best_region_for_doubt(question=message, regions=regions_list)
+            yield {
+                "type": "image_annotation",
+                "image_url": lecture_image.image_url,
+                "highlight_region": best,
+                "all_regions": regions_list,
+            }
+    except Exception as e:
+        logger.warning("Image annotation SSE lookup failed (pro): %s", e)
+
     chat_obj = await _get_or_create_doubt_chat(db, tenant_id, user_id, lecture_id, chat_id)
     history = await get_chat_history(db, chat_obj.id)
     lang_instruction = _language_instruction(subject_name)
@@ -1263,6 +1616,26 @@ async def _stream_ultra_doubt(
     """Stream ULTRA tier doubt response as SSE-style events."""
     chunks = await get_similar_chunks(db, tenant_id, lecture_id, topic_name, limit=5)
     context = limit_context(chunks)
+
+    # Emit image annotation event before text streaming (non-critical)
+    try:
+        lecture_image = await _get_lecture_image_for_doubt(db, tenant_id, lecture_id)
+        if lecture_image and lecture_image.regions:
+            regions_list = [
+                {"id": str(r.id), "label": r.label, "x": r.x, "y": r.y,
+                 "w": r.w, "h": r.h, "color_hex": r.color_hex or "#EF9F27", "description": r.description}
+                for r in lecture_image.regions
+            ]
+            best = await pick_best_region_for_doubt(question=message, regions=regions_list)
+            yield {
+                "type": "image_annotation",
+                "image_url": lecture_image.image_url,
+                "highlight_region": best,
+                "all_regions": regions_list,
+            }
+    except Exception as e:
+        logger.warning("Image annotation SSE lookup failed (ultra): %s", e)
+
     chat_obj = await _get_or_create_doubt_chat(db, tenant_id, user_id, lecture_id, chat_id)
     history_raw = await get_chat_history(db, chat_obj.id)
     history = history_raw[-10:]
@@ -1524,6 +1897,76 @@ async def ask_doubt_admin_stream(
         payload.session_stage or "START",
     ):
         yield event
+
+
+async def list_lecture_images(
+    db: AsyncSession,
+    tenant_id: UUID,
+    lecture_id: UUID,
+) -> List["AILectureImage"]:
+    """Return all board images for a lecture ordered by sequence_order."""
+    result = await db.execute(
+        select(AILectureImage)
+        .where(
+            AILectureImage.lecture_id == lecture_id,
+            AILectureImage.tenant_id == tenant_id,
+        )
+        .options(selectinload(AILectureImage.regions))
+        .order_by(AILectureImage.sequence_order)
+    )
+    return list(result.scalars().all())
+
+
+async def get_lecture_image(
+    db: AsyncSession,
+    tenant_id: UUID,
+    lecture_id: UUID,
+    image_id: UUID,
+) -> Optional["AILectureImage"]:
+    """Return a single lecture image with regions, or None if not found / tenant mismatch."""
+    result = await db.execute(
+        select(AILectureImage)
+        .where(
+            AILectureImage.id == image_id,
+            AILectureImage.lecture_id == lecture_id,
+            AILectureImage.tenant_id == tenant_id,
+        )
+        .options(selectinload(AILectureImage.regions))
+    )
+    return result.scalar_one_or_none()
+
+
+async def delete_lecture_image(
+    db: AsyncSession,
+    tenant_id: UUID,
+    user_id: UUID,
+    lecture_id: UUID,
+    image_id: UUID,
+    is_admin: bool = False,
+) -> bool:
+    """Delete a lecture image (and cascade its regions). Returns True if deleted, False if not found."""
+    result = await db.execute(
+        select(AILectureImage).where(
+            AILectureImage.id == image_id,
+            AILectureImage.lecture_id == lecture_id,
+            AILectureImage.tenant_id == tenant_id,
+        )
+    )
+    img = result.scalar_one_or_none()
+    if not img:
+        return False
+
+    lecture = await db.get(AILectureSession, lecture_id)
+    if not is_admin and lecture and lecture.teacher_id != user_id:
+        raise ServiceError("Permission denied", status.HTTP_403_FORBIDDEN)
+
+    # Delete from S3 (non-blocking, errors are logged not raised)
+    from app.core.s3 import delete_image_from_s3
+    await delete_image_from_s3(img.image_url)
+
+    await db.delete(img)
+    await db.commit()
+    return True
 
 
 async def get_lecture(

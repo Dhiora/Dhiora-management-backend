@@ -57,6 +57,8 @@ from app.core.models.ai_lecture_session import AILectureSession
 from app.core.models.ai_lecture_chunk import AILectureChunk
 from app.core.models.ai_doubt_chat import AIDoubtChat
 from app.core.models.ai_doubt_message import AIDoubtMessage
+from app.core.models.ai_lecture_image import AILectureImage
+from app.core.models.ai_image_region import AIImageRegion
 from app.core.models.management_knowledge_chunk import ManagementKnowledgeChunk
 from app.core.models.exam_type import ExamType
 from app.core.models.exam import Exam
@@ -129,6 +131,8 @@ __all__ = [
     "AILectureChunk",
     "AIDoubtChat",
     "AIDoubtMessage",
+    "AILectureImage",
+    "AIImageRegion",
     "ManagementKnowledgeChunk",
     "ExamType",
     "Exam",

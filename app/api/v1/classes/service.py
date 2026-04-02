@@ -6,9 +6,8 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth.models import StudentProfile
 from app.core.exceptions import ServiceError
-from app.core.models import SchoolClass
+from app.core.models import SchoolClass, StudentAcademicRecord
 
 from .schemas import ClassBulkItem, ClassCreate, ClassResponse, ClassUpdate
 
@@ -158,7 +157,12 @@ async def delete_class(
         return False
     if block_if_used:
         used = await db.execute(
-            select(StudentProfile.id).where(StudentProfile.class_id == class_id).limit(1)
+            select(StudentAcademicRecord.id)
+            .where(
+                StudentAcademicRecord.class_id == class_id,
+                StudentAcademicRecord.status == "ACTIVE",
+            )
+            .limit(1)
         )
         if used.scalar_one_or_none() is not None:
             raise ServiceError("Cannot delete class: it is used by students", status.HTTP_400_BAD_REQUEST)

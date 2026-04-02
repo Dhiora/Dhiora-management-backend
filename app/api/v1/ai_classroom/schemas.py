@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import List, Literal, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class LectureCreate(BaseModel):
@@ -92,10 +92,39 @@ class DoubtMessageResponse(BaseModel):
         from_attributes = True
 
 
+class ImageRegionSchema(BaseModel):
+    id: UUID
+    label: str
+    x: float
+    y: float
+    w: float
+    h: float
+    color_hex: str
+    description: Optional[str] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class LectureImageResponse(BaseModel):
+    id: UUID
+    lecture_id: UUID
+    chunk_id: Optional[UUID] = None
+    image_url: str
+    sequence_order: int
+    topic_label: Optional[str] = None
+    regions: List[ImageRegionSchema] = Field(default_factory=list)
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class DoubtAskResponse(BaseModel):
     chat_id: UUID
     answer: str
     message: DoubtMessageResponse
+    image_url: Optional[str] = None
+    highlight_region: Optional[ImageRegionSchema] = None
+    all_regions: Optional[List[ImageRegionSchema]] = None
 
 
 class DoubtChatResponse(BaseModel):

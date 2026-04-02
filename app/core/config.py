@@ -39,6 +39,13 @@ class Settings(BaseSettings):
     razorpay_key_id: Optional[str] = Field(None, alias="RAZORPAY_KEY_ID")
     razorpay_key_secret: Optional[str] = Field(None, alias="RAZORPAY_KEY_SECRET")
 
+    # AWS S3 — board image storage
+    aws_access_key_id: Optional[str] = Field(None, alias="AWS_ACCESS_KEY_ID")
+    aws_secret_access_key: Optional[str] = Field(None, alias="AWS_SECRET_ACCESS_KEY")
+    aws_region: str = Field("ap-south-1", alias="AWS_REGION")
+    s3_bucket_name: Optional[str] = Field(None, alias="S3_BUCKET_NAME")
+    s3_base_url: Optional[str] = Field(None, alias="S3_BASE_URL")  # optional CDN prefix; falls back to default S3 URL
+
     redis_url: str = Field("redis://localhost:6379/0", alias="REDIS_URL")
     redis_cache_ttl_seconds: int = Field(300, alias="REDIS_CACHE_TTL_SECONDS")
 
