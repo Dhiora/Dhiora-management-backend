@@ -105,7 +105,7 @@ class SubscriptionPlanResponse(BaseModel):
     id: UUID
     name: str
     organization_type: str
-    modules_include: List[UUID]
+    modules_include: List[str]
     price: str
     discount_price: Optional[str] = None
     description: Optional[str] = None

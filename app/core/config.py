@@ -49,6 +49,11 @@ class Settings(BaseSettings):
     redis_url: str = Field("redis://localhost:6379/0", alias="REDIS_URL")
     redis_cache_ttl_seconds: int = Field(300, alias="REDIS_CACHE_TTL_SECONDS")
 
+    # Dangerous test-only endpoints (DB wipe, seeded org). Keep disabled in production.
+    enable_test_apis: bool = Field(False, alias="ENABLE_TEST_APIS")
+    # If set, callers must send header X-Test-Api-Key with this value.
+    test_api_secret: Optional[str] = Field(None, alias="TEST_API_SECRET")
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

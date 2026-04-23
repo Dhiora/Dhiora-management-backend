@@ -35,6 +35,10 @@ from app.api.v1.ws.router import router as ws_router
 from app.api.v1.holiday_calendar.router import router as holiday_calendar_router
 from app.api.v1.dashboard.router import router as dashboard_router
 from app.api.v1.online_assessments.router import router as online_assessments_router
+from app.api.v1.test.router import router as test_router
+from app.api.v1.school_profile.router import router as school_profile_router
+from app.api.v1.stationary.router import router as stationary_router
+from app.api.v1.super_admin.router import router as super_admin_router
 from modules.payroll import models as payroll_models  # noqa: F401 - register payroll tables with SQLAlchemy
 from modules.payroll.router import router as payroll_router
 
@@ -87,6 +91,10 @@ def create_app() -> FastAPI:
     app.include_router(dashboard_router)
     app.include_router(payroll_router)
     app.include_router(online_assessments_router)
+    app.include_router(school_profile_router)
+    app.include_router(stationary_router)
+    app.include_router(super_admin_router)
+    app.include_router(test_router)
 
     return app
 

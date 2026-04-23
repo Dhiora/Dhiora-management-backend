@@ -207,21 +207,31 @@ async def delete_organization_type_module(
 # --- Subscription plans ---
 
 
-def _subscription_plan_to_response(plan: SubscriptionPlan) -> SubscriptionPlanResponse:
-    """Build SubscriptionPlanResponse from model. Coerce modules_include to List[UUID]."""
-    raw = plan.modules_include or []
-    module_ids = [UUID(str(x)) for x in raw] if raw else []
+def _subscription_plan_to_response(plan: SubscriptionPlan, module_names: list[str]) -> SubscriptionPlanResponse:
+    """Build SubscriptionPlanResponse from model with resolved module names."""
     return SubscriptionPlanResponse(
         id=plan.id,
         name=plan.name,
         organization_type=getattr(plan, "organization_type", "School") or "School",
-        modules_include=module_ids,
+        modules_include=module_names,
         price=plan.price or "",
         discount_price=plan.discount_price,
         description=plan.description,
         created_at=plan.created_at,
         updated_at=plan.updated_at,
     )
+
+
+async def _resolve_module_names(db: AsyncSession, module_ids: list) -> list[str]:
+    """Fetch module_name for each UUID in module_ids, preserving order."""
+    if not module_ids:
+        return []
+    uuids = [UUID(str(x)) for x in module_ids]
+    result = await db.execute(
+        select(Module.id, Module.module_name).where(Module.id.in_(uuids))
+    )
+    id_to_name = {row[0]: row[1] for row in result.all()}
+    return [id_to_name[uid] for uid in uuids if uid in id_to_name]
 
 
 async def list_subscription_plans(
@@ -234,7 +244,11 @@ async def list_subscription_plans(
         stmt = stmt.where(SubscriptionPlan.organization_type == organization_type)
     result = await db.execute(stmt)
     plans = result.scalars().all()
-    return [_subscription_plan_to_response(p) for p in plans]
+    responses = []
+    for p in plans:
+        module_names = await _resolve_module_names(db, p.modules_include or [])
+        responses.append(_subscription_plan_to_response(p, module_names))
+    return responses
 
 
 async def get_subscription_plan(
@@ -250,7 +264,8 @@ async def get_subscription_plan(
             f"Subscription plan not found: {plan_id}",
             status_code=status.HTTP_404_NOT_FOUND,
         )
-    return _subscription_plan_to_response(plan)
+    module_names = await _resolve_module_names(db, plan.modules_include or [])
+    return _subscription_plan_to_response(plan, module_names)
 
 
 async def create_subscription_plan(
@@ -295,7 +310,8 @@ async def create_subscription_plan(
     db.add(plan)
     await db.commit()
     await db.refresh(plan)
-    return _subscription_plan_to_response(plan)
+    module_names = await _resolve_module_names(db, plan.modules_include or [])
+    return _subscription_plan_to_response(plan, module_names)
 
 
 async def update_subscription_plan(
@@ -357,7 +373,8 @@ async def update_subscription_plan(
         plan.description = payload.description
     await db.commit()
     await db.refresh(plan)
-    return _subscription_plan_to_response(plan)
+    module_names = await _resolve_module_names(db, plan.modules_include or [])
+    return _subscription_plan_to_response(plan, module_names)
 
 
 async def delete_subscription_plan(db: AsyncSession, plan_id: UUID) -> None:

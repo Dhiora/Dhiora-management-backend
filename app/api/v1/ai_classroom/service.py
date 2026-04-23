@@ -6,7 +6,7 @@ import logging
 import os
 import subprocess
 import tempfile
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import AsyncGenerator, Iterable, List, Optional, Tuple
 from uuid import UUID
 import openai
@@ -26,6 +26,8 @@ from app.core.models import (
     AILectureChunk,
     AILectureImage,
     AILectureSession,
+    AITokenUsage,
+    AIWhisperUsage,
     AcademicYear,
     ManagementKnowledgeChunk,
     SchoolClass,
@@ -53,6 +55,56 @@ MODEL_MGMT    = "gpt-4o-mini"   # management chat — factual retrieval, no deep
 MODEL_VISION  = "gpt-4o"        # vision model for board image region extraction
 
 _REGION_COLORS = ["#EF9F27", "#378ADD", "#1D9E75", "#D4537E", "#7F77DD", "#D85A30"]
+
+
+async def _log_token_usage(
+    db: AsyncSession,
+    tenant_id: UUID,
+    student_id: Optional[UUID],
+    chat_id: Optional[UUID],
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+) -> None:
+    """Persist token usage record for super admin reporting. Non-critical: swallows errors."""
+    try:
+        record = AITokenUsage(
+            tenant_id=tenant_id,
+            student_id=student_id,
+            chat_id=chat_id,
+            usage_date=date.today(),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=input_tokens + output_tokens,
+            model_used=model,
+        )
+        db.add(record)
+        # Committed by caller alongside the message; no extra commit needed.
+    except Exception as exc:
+        logger.warning("_log_token_usage failed (non-critical): %s", exc)
+
+async def _log_whisper_usage(
+    db: AsyncSession,
+    tenant_id: UUID,
+    teacher_id: Optional[UUID],
+    lecture_session_id: Optional[UUID],
+    duration_seconds: float,
+) -> None:
+    """Persist Whisper audio duration record for super admin reporting. Non-critical."""
+    try:
+        if duration_seconds <= 0:
+            return
+        record = AIWhisperUsage(
+            tenant_id=tenant_id,
+            teacher_id=teacher_id,
+            lecture_session_id=lecture_session_id,
+            usage_date=date.today(),
+            audio_duration_seconds=duration_seconds,
+        )
+        db.add(record)
+    except Exception as exc:
+        logger.warning("_log_whisper_usage failed (non-critical): %s", exc)
+
 
 _CONTEXT_MAX_CHARS = 2000  # ~500 tokens — covers 3-4 relevant chunks comfortably
 
@@ -247,11 +299,11 @@ async def romanize_indian_script(text: str) -> str:
     return result
 
 
-async def _transcribe_file_path(audio_path: str, filename: str = "audio.webm") -> str:
-    """Transcribe a single file path, returning romanized text."""
+async def _transcribe_file_path(audio_path: str, filename: str = "audio.webm") -> Tuple[str, float]:
+    """Transcribe a single file path. Returns (romanized_text, duration_seconds)."""
     audio_bytes = await asyncio.to_thread(lambda: open(audio_path, "rb").read())
     if not audio_bytes:
-        return ""
+        return "", 0.0
     audio_file = io.BytesIO(audio_bytes)
     audio_file.name = filename
     result = await client.audio.transcriptions.create(
@@ -262,15 +314,18 @@ async def _transcribe_file_path(audio_path: str, filename: str = "audio.webm") -
         prompt=MULTILINGUAL_PROMPT,
     )
     raw = result if isinstance(result, str) else result.text
-    return await romanize_indian_script(raw)
+    duration_seconds = float(getattr(result, "duration", 0.0) or 0.0)
+    text = await romanize_indian_script(raw)
+    return text, duration_seconds
 
 
-async def transcribe_in_chunks(audio_path: str, chunk_duration_s: int = 30) -> str:
+async def transcribe_in_chunks(audio_path: str, chunk_duration_s: int = 30) -> Tuple[str, float]:
     """
     Split audio into N-second chunks via ffmpeg, transcribe each with Whisper,
     then concatenate. Each chunk uses the tail of the previous transcript as prompt
     for context continuity (especially important for mixed-language content).
 
+    Returns (transcript_text, total_audio_duration_seconds).
     Falls back to single-file transcription if ffmpeg splitting fails.
     """
     import glob
@@ -298,6 +353,7 @@ async def transcribe_in_chunks(audio_path: str, chunk_duration_s: int = 30) -> s
             return await _transcribe_file_path(audio_path)
 
         transcript_parts: List[str] = []
+        total_duration_seconds: float = 0.0
         for chunk_path in chunk_files:
             chunk_bytes = await asyncio.to_thread(lambda p=chunk_path: open(p, "rb").read())
             if not chunk_bytes:
@@ -318,6 +374,8 @@ async def transcribe_in_chunks(audio_path: str, chunk_duration_s: int = 30) -> s
                     prompt=contextual_prompt,
                 )
                 raw = result if isinstance(result, str) else result.text
+                chunk_duration = float(getattr(result, "duration", 0.0) or 0.0)
+                total_duration_seconds += chunk_duration
                 if raw:
                     romanized = await romanize_indian_script(raw)
                     transcript_parts.append(romanized)
@@ -325,7 +383,7 @@ async def transcribe_in_chunks(audio_path: str, chunk_duration_s: int = 30) -> s
             except Exception as e:
                 logger.warning("Chunk %s transcription failed: %s", chunk_path, e)
 
-        return " ".join(transcript_parts)
+        return " ".join(transcript_parts), total_duration_seconds
 
     except Exception as e:
         logger.warning("Chunked transcription failed (%s), falling back to full-file", e)
@@ -337,8 +395,9 @@ async def transcribe_in_chunks(audio_path: str, chunk_duration_s: int = 30) -> s
             pass
 
 
-async def transcribe_audio(file: UploadFile) -> str:
-    """Transcribe audio: save to temp file → send audio directly to Whisper."""
+async def transcribe_audio(file: UploadFile) -> Tuple[str, float]:
+    """Transcribe audio: save to temp file → send audio directly to Whisper.
+    Returns (transcript_text, audio_duration_seconds)."""
     if not file.content_type or not file.content_type.startswith("audio/"):
         raise ServiceError("Invalid file type. Expected audio file.", status.HTTP_400_BAD_REQUEST)
 
@@ -376,8 +435,10 @@ async def transcribe_audio(file: UploadFile) -> str:
             prompt=MULTILINGUAL_PROMPT,
         )
         raw_transcript = transcription if isinstance(transcription, str) else transcription.text
+        duration_seconds = float(getattr(transcription, "duration", 0.0) or 0.0)
         logger.info("Whisper raw transcript (upload endpoint): %s", raw_transcript)
-        return await romanize_indian_script(raw_transcript)
+        text = await romanize_indian_script(raw_transcript)
+        return text, duration_seconds
     except ServiceError:
         raise
     except openai.APIError as e:
@@ -911,7 +972,7 @@ async def create_lecture(
     if not subj or subj.tenant_id != tenant_id:
         raise ServiceError("Subject not found", status.HTTP_404_NOT_FOUND)
 
-    transcript = await transcribe_audio(audio_file)
+    transcript, whisper_duration_s = await transcribe_audio(audio_file)
 
     lecture = AILectureSession(
         tenant_id=tenant_id,
@@ -925,6 +986,9 @@ async def create_lecture(
     )
     db.add(lecture)
     await db.flush()
+
+    # Log Whisper usage for this upload transcription
+    await _log_whisper_usage(db, tenant_id, teacher_id, lecture.id, whisper_duration_s)
 
     chunks = chunk_text(transcript)
     if chunks:
@@ -1006,6 +1070,7 @@ If the answer is not found in the context, politely say that this topic was not 
         )
 
         ai_answer = response.choices[0].message.content
+        _usage = response.usage
     except openai.APIError as e:
         raise ServiceError(f"OpenAI API error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
     except Exception as e:
@@ -1042,6 +1107,12 @@ If the answer is not found in the context, politely say that this topic was not 
         message=ai_answer,
     )
     db.add(ai_message)
+
+    if _usage:
+        await _log_token_usage(
+            db, tenant_id, student_id, chat_obj.id,
+            MODEL_BASIC, _usage.prompt_tokens, _usage.completion_tokens,
+        )
 
     await db.commit()
     await db.refresh(chat_obj)
@@ -1247,6 +1318,7 @@ async def _handle_basic_doubt(
             temperature=0.5,
         )
         ai_answer = response.choices[0].message.content
+        _usage = response.usage
     except openai.APIError as e:
         raise ServiceError(f"OpenAI API error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
     except Exception as e:
@@ -1256,6 +1328,11 @@ async def _handle_basic_doubt(
     db.add(student_message)
     ai_message = AIDoubtMessage(chat_id=chat_obj.id, role="AI", message=ai_answer)
     db.add(ai_message)
+    if _usage:
+        await _log_token_usage(
+            db, tenant_id, user_id, chat_obj.id,
+            MODEL_BASIC, _usage.prompt_tokens, _usage.completion_tokens,
+        )
     await db.commit()
     await db.refresh(chat_obj)
     await db.refresh(ai_message)
@@ -1311,6 +1388,7 @@ async def _handle_pro_doubt(
             temperature=0.7,
         )
         ai_answer = response.choices[0].message.content
+        _usage = response.usage
     except openai.APIError as e:
         raise ServiceError(f"OpenAI API error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
     except Exception as e:
@@ -1320,6 +1398,11 @@ async def _handle_pro_doubt(
     db.add(student_message)
     ai_message = AIDoubtMessage(chat_id=chat_obj.id, role="AI", message=ai_answer)
     db.add(ai_message)
+    if _usage:
+        await _log_token_usage(
+            db, tenant_id, user_id, chat_obj.id,
+            MODEL_PRO, _usage.prompt_tokens, _usage.completion_tokens,
+        )
     await db.commit()
     await db.refresh(chat_obj)
     await db.refresh(ai_message)
@@ -1400,6 +1483,7 @@ async def _handle_ultra_doubt(
             temperature=0.8,
         )
         ai_answer = response.choices[0].message.content
+        _usage = response.usage
     except openai.APIError as e:
         raise ServiceError(f"OpenAI API error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
     except Exception as e:
@@ -1410,6 +1494,11 @@ async def _handle_ultra_doubt(
     db.add(student_message)
     ai_message = AIDoubtMessage(chat_id=chat_obj.id, role="AI", message=ai_answer)
     db.add(ai_message)
+    if _usage:
+        await _log_token_usage(
+            db, tenant_id, user_id, chat_obj.id,
+            MODEL_ULTRA, _usage.prompt_tokens, _usage.completion_tokens,
+        )
     await db.commit()
     await db.refresh(chat_obj)
     await db.refresh(ai_message)
@@ -1467,13 +1556,17 @@ async def _stream_basic_doubt(
             messages=messages,
             temperature=0.5,
             stream=True,
+            stream_options={"include_usage": True},
         )
         full_content = []
+        _stream_usage = None
         async for chunk in stream:
             if chunk.choices and len(chunk.choices) > 0 and chunk.choices[0].delta.content:
                 content = chunk.choices[0].delta.content
                 full_content.append(content)
                 yield {"type": "chunk", "content": content}
+            if getattr(chunk, "usage", None):
+                _stream_usage = chunk.usage
         ai_answer = "".join(full_content)
     except openai.APIError as e:
         raise ServiceError(f"OpenAI API error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -1484,6 +1577,11 @@ async def _stream_basic_doubt(
     db.add(student_message)
     ai_message = AIDoubtMessage(chat_id=chat_obj.id, role="AI", message=ai_answer)
     db.add(ai_message)
+    if _stream_usage:
+        await _log_token_usage(
+            db, tenant_id, user_id, chat_obj.id,
+            MODEL_BASIC, _stream_usage.prompt_tokens, _stream_usage.completion_tokens,
+        )
     await db.commit()
     await db.refresh(chat_obj)
     await db.refresh(ai_message)
@@ -1570,13 +1668,17 @@ async def _stream_pro_doubt(
             messages=messages,
             temperature=0.7,
             stream=True,
+            stream_options={"include_usage": True},
         )
         full_content = []
+        _stream_usage = None
         async for chunk in stream:
             if chunk.choices and len(chunk.choices) > 0 and chunk.choices[0].delta.content:
                 content = chunk.choices[0].delta.content
                 full_content.append(content)
                 yield {"type": "chunk", "content": content}
+            if getattr(chunk, "usage", None):
+                _stream_usage = chunk.usage
         ai_answer = "".join(full_content)
     except openai.APIError as e:
         raise ServiceError(f"OpenAI API error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -1586,6 +1688,11 @@ async def _stream_pro_doubt(
     db.add(student_message)
     ai_message = AIDoubtMessage(chat_id=chat_obj.id, role="AI", message=ai_answer)
     db.add(ai_message)
+    if _stream_usage:
+        await _log_token_usage(
+            db, tenant_id, user_id, chat_obj.id,
+            MODEL_PRO, _stream_usage.prompt_tokens, _stream_usage.completion_tokens,
+        )
     await db.commit()
     await db.refresh(chat_obj)
     await db.refresh(ai_message)
@@ -1697,13 +1804,17 @@ async def _stream_ultra_doubt(
             messages=messages,
             temperature=0.8,
             stream=True,
+            stream_options={"include_usage": True},
         )
         full_content = []
+        _stream_usage = None
         async for chunk in stream:
             if chunk.choices and len(chunk.choices) > 0 and chunk.choices[0].delta.content:
                 content = chunk.choices[0].delta.content
                 full_content.append(content)
                 yield {"type": "chunk", "content": content}
+            if getattr(chunk, "usage", None):
+                _stream_usage = chunk.usage
         ai_answer = "".join(full_content)
     except openai.APIError as e:
         raise ServiceError(f"OpenAI API error: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -1714,6 +1825,11 @@ async def _stream_ultra_doubt(
     db.add(student_message)
     ai_message = AIDoubtMessage(chat_id=chat_obj.id, role="AI", message=ai_answer)
     db.add(ai_message)
+    if _stream_usage:
+        await _log_token_usage(
+            db, tenant_id, user_id, chat_obj.id,
+            MODEL_ULTRA, _stream_usage.prompt_tokens, _stream_usage.completion_tokens,
+        )
     await db.commit()
     await db.refresh(chat_obj)
     await db.refresh(ai_message)
@@ -2367,8 +2483,10 @@ async def process_lecture_background(session_id: UUID) -> None:
                 return
 
             # Chunked transcription: 30s slices → faster + cheaper + real-time feel
-            transcript = await transcribe_in_chunks(audio_path, chunk_duration_s=30)
-            logger.info("Chunked transcript (recording pipeline): %d chars", len(transcript))
+            transcript, whisper_duration_s = await transcribe_in_chunks(audio_path, chunk_duration_s=30)
+            logger.info("Chunked transcript (recording pipeline): %d chars, %.1fs audio", len(transcript), whisper_duration_s)
+            # Log Whisper usage for this recording transcription
+            await _log_whisper_usage(db, tenant_id, session.teacher_id, session_id, whisper_duration_s)
             session.transcript = transcript
             session.processing_stage = "CHUNKING"
             session.upload_progress_percent = max(session.upload_progress_percent or 0, 40)

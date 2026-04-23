@@ -107,6 +107,33 @@ class RoleResponse(BaseModel):
     is_default: bool = False  # True if role is platform default (visible to all tenants)
 
 
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ForgotPasswordResponse(BaseModel):
+    message: str
+    # Token is returned directly (no email service configured yet).
+    # In production this would be delivered by email only.
+    reset_token: str
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str = Field(..., min_length=8)
+    confirm_password: str = Field(..., min_length=8)
+
+    @model_validator(mode="after")
+    def passwords_must_match(self) -> "ResetPasswordRequest":
+        if self.new_password != self.confirm_password:
+            raise ValueError("new_password and confirm_password do not match")
+        return self
+
+
+class ResetPasswordResponse(BaseModel):
+    message: str
+
+
 class CurrentUser(BaseModel):
     """Lightweight representation of the authenticated user for RBAC checks.
     academic_year_id and academic_year_status come from the ACTIVE academic year at login.

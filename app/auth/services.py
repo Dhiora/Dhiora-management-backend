@@ -1,4 +1,5 @@
-from datetime import datetime, timezone
+import secrets
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from uuid import UUID
 
@@ -9,10 +10,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.schemas import (
     AcademicYearContext,
+    ForgotPasswordRequest,
+    ForgotPasswordResponse,
     LoginRequest,
     LoginResponse,
     RegisterRequest,
     RegisterResponse,
+    ResetPasswordRequest,
+    ResetPasswordResponse,
     TenantInfo,
     UserInfo,
 )
@@ -22,10 +27,12 @@ from app.auth.security import (
     hash_password,
     verify_password,
 )
-from app.auth.models import RefreshToken, Role, User
+from app.auth.models import PasswordResetToken, RefreshToken, Role, User
 from app.core.exceptions import ServiceError
 from app.core.models import AcademicYear, Module, Tenant, TenantModule
 from app.core.tenant_service import generate_organization_code
+
+_RESET_TOKEN_EXPIRE_MINUTES = 60
 
 
 async def register_tenant_and_admin(
@@ -265,4 +272,85 @@ async def login_user(db: AsyncSession, payload: LoginRequest) -> LoginResponse:
         academic_year=academic_year_ctx,
         issued_at=issued_at,
     )
+
+
+async def request_password_reset(
+    db: AsyncSession, payload: ForgotPasswordRequest
+) -> ForgotPasswordResponse:
+    # Look up user by email (case-insensitive)
+    stmt = select(User).where(func.lower(User.email) == func.lower(payload.email))
+    result = await db.execute(stmt)
+    user: Optional[User] = result.scalar_one_or_none()
+
+    if not user:
+        raise ServiceError("No account found with that email address", status.HTTP_404_NOT_FOUND)
+
+    if user.status != "ACTIVE":
+        raise ServiceError("Account is inactive", status.HTTP_403_FORBIDDEN)
+
+    # Invalidate any existing unused tokens for this user
+    existing_stmt = select(PasswordResetToken).where(
+        PasswordResetToken.user_id == user.id,
+        PasswordResetToken.used_at.is_(None),
+    )
+    existing_result = await db.execute(existing_stmt)
+    for old_token in existing_result.scalars().all():
+        await db.delete(old_token)
+
+    # Create new reset token
+    raw_token = secrets.token_urlsafe(48)
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=_RESET_TOKEN_EXPIRE_MINUTES)
+    reset_token = PasswordResetToken(
+        user_id=user.id,
+        token=raw_token,
+        expires_at=expires_at,
+    )
+    db.add(reset_token)
+
+    try:
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        raise ServiceError("Failed to generate reset token", status.HTTP_500_INTERNAL_SERVER_ERROR) from e
+
+    return ForgotPasswordResponse(
+        message="Password reset token generated. Use it within 60 minutes.",
+        reset_token=raw_token,
+    )
+
+
+async def reset_password(
+    db: AsyncSession, payload: ResetPasswordRequest
+) -> ResetPasswordResponse:
+    # Look up the token
+    stmt = select(PasswordResetToken).where(PasswordResetToken.token == payload.token)
+    result = await db.execute(stmt)
+    reset_token: Optional[PasswordResetToken] = result.scalar_one_or_none()
+
+    if not reset_token:
+        raise ServiceError("Invalid or expired reset token", status.HTTP_400_BAD_REQUEST)
+
+    now = datetime.now(timezone.utc)
+
+    if reset_token.used_at is not None:
+        raise ServiceError("Reset token has already been used", status.HTTP_400_BAD_REQUEST)
+
+    if reset_token.expires_at.replace(tzinfo=timezone.utc) < now:
+        raise ServiceError("Reset token has expired", status.HTTP_400_BAD_REQUEST)
+
+    # Fetch and update the user's password
+    user: Optional[User] = await db.get(User, reset_token.user_id)
+    if not user or user.status != "ACTIVE":
+        raise ServiceError("User account not found or inactive", status.HTTP_403_FORBIDDEN)
+
+    user.password_hash = hash_password(payload.new_password)
+    reset_token.used_at = now
+
+    try:
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        raise ServiceError("Failed to update password", status.HTTP_500_INTERNAL_SERVER_ERROR) from e
+
+    return ResetPasswordResponse(message="Password has been reset successfully. Please log in with your new password.")
 

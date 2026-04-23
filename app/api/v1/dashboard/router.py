@@ -26,6 +26,7 @@ from .schemas import (
     HomeworkStatusResponse,
     LessonProgressResponse,
     PayrollStatusResponse,
+    SetupProgressResponse,
     TimetableEntryResponse,
     UpcomingExamItem,
 )
@@ -38,6 +39,30 @@ router = APIRouter(prefix="/api/v1/dashboard", tags=["dashboard"])
 def _ay(current_user: CurrentUser = Depends(get_current_user)) -> Optional[str]:
     """Extract academic_year_id from the resolved JWT user (used as sub-dep)."""
     return current_user.academic_year_id
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  0. FRONTEND SETUP PROGRESS
+# ════════════════════════════════════════════════════════════════════════════
+
+@router.get(
+    "/setup-progress",
+    response_model=SetupProgressResponse,
+    summary="Tenant setup progress",
+    description=(
+        "Returns setup completion status for school onboarding. "
+        "Includes required and optional steps, completion counts, and current paused step."
+    ),
+)
+async def get_setup_progress(
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+) -> SetupProgressResponse:
+    return await service.get_setup_progress(
+        db,
+        tenant_id=current_user.tenant_id,
+        academic_year_id=current_user.academic_year_id,
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════════

@@ -206,6 +206,29 @@ class AdminSummaryResponse(BaseModel):
     academic_year: AcademicYearBlock = Field(default_factory=AcademicYearBlock)
 
 
+# ── Setup progress (frontend onboarding wizard) ──────────────────────────────
+
+class SetupStepStatus(BaseModel):
+    """Single setup step status used by GET /dashboard/setup-progress."""
+
+    key: str
+    title: str
+    required: bool = True
+    completed: bool = False
+    count: int = 0
+
+
+class SetupProgressResponse(BaseModel):
+    """Tenant setup completion status and current paused step."""
+
+    is_completed: bool = False
+    paused_at_step: Optional[str] = None
+    paused_at_title: Optional[str] = None
+    completed_required_steps: int = 0
+    total_required_steps: int = 0
+    steps: List[SetupStepStatus] = Field(default_factory=list)
+
+
 # ── 2. Attendance today ──────────────────────────────────────────────────────
 
 class AttendanceGroup(BaseModel):

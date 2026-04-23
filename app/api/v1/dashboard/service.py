@@ -18,10 +18,12 @@ from uuid import UUID
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth.models import User
+from app.auth.models import Role, User
 from app.core.config import settings
 from app.core.models import (
     AcademicYear,
+    ClassSubject,
+    ClassTeacherAssignment,
     Department,
     EmployeeAttendance,
     Exam,
@@ -30,6 +32,7 @@ from app.core.models import (
     SchoolClass,
     Section,
     StudentAcademicRecord,
+    TeacherSubjectAssignment,
     StudentDailyAttendance,
     StudentDailyAttendanceRecord,
     StudentFeeAssignment,
@@ -66,6 +69,8 @@ from .schemas import (
     StaffSummaryBlock,
     StudentSummaryBlock,
     TeacherSummaryBlock,
+    SetupProgressResponse,
+    SetupStepStatus,
     AttendanceTodayResponse,
     AttendanceGroup,
     AttendanceTrendsResponse,
@@ -96,6 +101,212 @@ def _to_decimal(val: Any) -> Decimal:
     if val is None:
         return Decimal("0")
     return val if isinstance(val, Decimal) else Decimal(str(val))
+
+
+async def _count(db: AsyncSession, stmt) -> int:
+    return int((await db.execute(stmt)).scalar() or 0)
+
+
+async def get_setup_progress(
+    db: AsyncSession,
+    tenant_id: UUID,
+    academic_year_id: Optional[UUID],
+) -> SetupProgressResponse:
+    if not academic_year_id:
+        academic_year_id = (
+            await db.execute(
+                select(AcademicYear.id).where(
+                    AcademicYear.tenant_id == tenant_id,
+                    AcademicYear.is_current.is_(True),
+                ).limit(1)
+            )
+        ).scalar_one_or_none()
+
+    departments_count = await _count(
+        db,
+        select(func.count(Department.id)).where(
+            Department.tenant_id == tenant_id,
+            Department.is_active.is_(True),
+        ),
+    )
+    roles_count = await _count(
+        db,
+        select(func.count(Role.id)).where(Role.tenant_id == tenant_id),
+    )
+    classes_count = await _count(
+        db,
+        select(func.count(SchoolClass.id)).where(
+            SchoolClass.tenant_id == tenant_id,
+            SchoolClass.is_active.is_(True),
+        ),
+    )
+    employees_count = await _count(
+        db,
+        select(func.count(User.id)).where(
+            User.tenant_id == tenant_id,
+            User.user_type == "employee",
+            User.status != "DELETED",
+        ),
+    )
+    subjects_count = await _count(
+        db,
+        select(func.count(SchoolSubject.id)).where(
+            SchoolSubject.tenant_id == tenant_id,
+            SchoolSubject.is_active.is_(True),
+        ),
+    )
+    time_slots_count = await _count(
+        db,
+        select(func.count(TimeSlot.id)).where(
+            TimeSlot.tenant_id == tenant_id,
+            TimeSlot.is_active.is_(True),
+        ),
+    )
+
+    if academic_year_id:
+        sections_count = await _count(
+            db,
+            select(func.count(Section.id)).where(
+                Section.tenant_id == tenant_id,
+                Section.academic_year_id == academic_year_id,
+                Section.is_active.is_(True),
+            ),
+        )
+        class_subjects_count = await _count(
+            db,
+            select(func.count(ClassSubject.id)).where(
+                ClassSubject.tenant_id == tenant_id,
+                ClassSubject.academic_year_id == academic_year_id,
+            ),
+        )
+        teacher_subject_assignments_count = await _count(
+            db,
+            select(func.count(TeacherSubjectAssignment.id)).where(
+                TeacherSubjectAssignment.tenant_id == tenant_id,
+                TeacherSubjectAssignment.academic_year_id == academic_year_id,
+            ),
+        )
+        timetables_count = await _count(
+            db,
+            select(func.count(Timetable.id)).where(
+                Timetable.tenant_id == tenant_id,
+                Timetable.academic_year_id == academic_year_id,
+            ),
+        )
+        class_teacher_assignments_count = await _count(
+            db,
+            select(func.count(ClassTeacherAssignment.id)).where(
+                ClassTeacherAssignment.tenant_id == tenant_id,
+                ClassTeacherAssignment.academic_year_id == academic_year_id,
+            ),
+        )
+    else:
+        sections_count = 0
+        class_subjects_count = 0
+        teacher_subject_assignments_count = 0
+        timetables_count = 0
+        class_teacher_assignments_count = 0
+
+    steps: List[SetupStepStatus] = [
+        SetupStepStatus(
+            key="academic_year_current",
+            title="Create current academic year",
+            required=True,
+            completed=bool(academic_year_id),
+            count=1 if academic_year_id else 0,
+        ),
+        SetupStepStatus(
+            key="departments",
+            title="Create departments",
+            required=True,
+            completed=departments_count > 0,
+            count=departments_count,
+        ),
+        SetupStepStatus(
+            key="roles",
+            title="Create roles (optional)",
+            required=False,
+            completed=roles_count > 0,
+            count=roles_count,
+        ),
+        SetupStepStatus(
+            key="classes",
+            title="Create classes",
+            required=True,
+            completed=classes_count > 0,
+            count=classes_count,
+        ),
+        SetupStepStatus(
+            key="sections",
+            title="Create sections",
+            required=True,
+            completed=sections_count > 0,
+            count=sections_count,
+        ),
+        SetupStepStatus(
+            key="employees_teachers",
+            title="Create employees/teachers",
+            required=True,
+            completed=employees_count > 0,
+            count=employees_count,
+        ),
+        SetupStepStatus(
+            key="subjects",
+            title="Create subjects",
+            required=True,
+            completed=subjects_count > 0,
+            count=subjects_count,
+        ),
+        SetupStepStatus(
+            key="class_subject_mappings",
+            title="Map subjects to classes",
+            required=True,
+            completed=class_subjects_count > 0,
+            count=class_subjects_count,
+        ),
+        SetupStepStatus(
+            key="teacher_subject_assignments",
+            title="Assign teachers to class-section-subject",
+            required=True,
+            completed=teacher_subject_assignments_count > 0,
+            count=teacher_subject_assignments_count,
+        ),
+        SetupStepStatus(
+            key="time_slots",
+            title="Create time slots",
+            required=True,
+            completed=time_slots_count > 0,
+            count=time_slots_count,
+        ),
+        SetupStepStatus(
+            key="timetables",
+            title="Create timetable",
+            required=True,
+            completed=timetables_count > 0,
+            count=timetables_count,
+        ),
+        SetupStepStatus(
+            key="class_teacher_assignment",
+            title="Assign class teacher (optional)",
+            required=False,
+            completed=class_teacher_assignments_count > 0,
+            count=class_teacher_assignments_count,
+        ),
+    ]
+
+    required_steps = [s for s in steps if s.required]
+    completed_required_steps = sum(1 for s in required_steps if s.completed)
+    total_required_steps = len(required_steps)
+
+    paused_step = next((s for s in required_steps if not s.completed), None)
+    return SetupProgressResponse(
+        is_completed=paused_step is None,
+        paused_at_step=paused_step.key if paused_step else None,
+        paused_at_title=paused_step.title if paused_step else None,
+        completed_required_steps=completed_required_steps,
+        total_required_steps=total_required_steps,
+        steps=steps,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════

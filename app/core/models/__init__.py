@@ -72,6 +72,10 @@ from app.core.models.online_assessment import (
 )
 from app.core.models.lesson_progress import LessonPlanProgress
 from app.core.models.dashboard_alert import DashboardAlert
+from app.core.models.stationary_resell import StationaryItem, StationaryResellItem, StationaryResellPayment
+from app.core.models.ai_token_usage import AITokenUsage
+from app.core.models.ai_whisper_usage import AIWhisperUsage
+from app.core.models.school_profile import SchoolProfile
 
 __all__ = [
     "AcademicYear",
@@ -144,5 +148,11 @@ __all__ = [
     "AssessmentAttemptAnswer",
     "LessonPlanProgress",
     "DashboardAlert",
+    "StationaryItem",
+    "StationaryResellPayment",
+    "StationaryResellItem",
+    "AITokenUsage",
+    "AIWhisperUsage",
+    "SchoolProfile",
 ]
 

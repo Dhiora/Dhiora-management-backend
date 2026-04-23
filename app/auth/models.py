@@ -8,6 +8,22 @@ from sqlalchemy.orm import relationship
 from app.db.session import Base
 
 
+class PasswordResetToken(Base):
+    """Single-use password reset tokens with a 1-hour TTL."""
+
+    __tablename__ = "password_reset_tokens"
+    __table_args__ = {"schema": "auth"}
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("auth.users.id", ondelete="CASCADE"), nullable=False)
+    token = Column(String(128), nullable=False, unique=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    used_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+
+    user = relationship("User", foreign_keys=[user_id])
+
+
 class User(Base):
     """User within a tenant, with role-based access to tenant modules."""
 

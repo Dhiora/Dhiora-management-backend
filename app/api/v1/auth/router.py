@@ -2,8 +2,17 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi import status as http_status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth.schemas import LoginRequest, LoginResponse, RegisterRequest, RegisterResponse
-from app.auth.services import ServiceError, login_user, register_tenant_and_admin
+from app.auth.schemas import (
+    ForgotPasswordRequest,
+    ForgotPasswordResponse,
+    LoginRequest,
+    LoginResponse,
+    RegisterRequest,
+    RegisterResponse,
+    ResetPasswordRequest,
+    ResetPasswordResponse,
+)
+from app.auth.services import ServiceError, login_user, register_tenant_and_admin, request_password_reset, reset_password
 from app.db.session import get_db
 from fastapi.security import OAuth2PasswordRequestForm
 
@@ -52,6 +61,36 @@ async def login(
             raise HTTPException(status_code=e.status_code, detail=e.message)
         if e.status_code == http_status.HTTP_500_INTERNAL_SERVER_ERROR:
             raise HTTPException(status_code=e.status_code, detail="Internal server error")
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+
+
+@router.post(
+    "/forgot-password",
+    response_model=ForgotPasswordResponse,
+    status_code=http_status.HTTP_200_OK,
+)
+async def forgot_password(
+    payload: ForgotPasswordRequest,
+    db: AsyncSession = Depends(get_db),
+) -> ForgotPasswordResponse:
+    try:
+        return await request_password_reset(db, payload)
+    except ServiceError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+
+
+@router.post(
+    "/reset-password",
+    response_model=ResetPasswordResponse,
+    status_code=http_status.HTTP_200_OK,
+)
+async def reset_password_endpoint(
+    payload: ResetPasswordRequest,
+    db: AsyncSession = Depends(get_db),
+) -> ResetPasswordResponse:
+    try:
+        return await reset_password(db, payload)
+    except ServiceError as e:
         raise HTTPException(status_code=e.status_code, detail=e.message)
 
 
