@@ -39,6 +39,8 @@ from app.api.v1.test.router import router as test_router
 from app.api.v1.school_profile.router import router as school_profile_router
 from app.api.v1.stationary.router import router as stationary_router
 from app.api.v1.super_admin.router import router as super_admin_router
+from app.api.v1.public.router import router as public_router
+from app.api.v1.platform_leads.router import router as platform_leads_router
 from modules.payroll import models as payroll_models  # noqa: F401 - register payroll tables with SQLAlchemy
 from modules.payroll.router import router as payroll_router
 
@@ -94,6 +96,8 @@ def create_app() -> FastAPI:
     app.include_router(school_profile_router)
     app.include_router(stationary_router)
     app.include_router(super_admin_router)
+    app.include_router(public_router)
+    app.include_router(platform_leads_router)
     app.include_router(test_router)
 
     return app
