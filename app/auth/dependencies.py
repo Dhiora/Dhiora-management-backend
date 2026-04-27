@@ -65,15 +65,14 @@ async def get_current_user(
     if not user or user.status != "ACTIVE":
         raise credentials_exception
 
-    # Load role permissions (tenant-scoped)
-    role_stmt = select(Role).where(Role.tenant_id == tenant_id, Role.name == role_name)
-    role_result = await db.execute(role_stmt)
-    role = role_result.scalar_one_or_none()
-
+    # Load role permissions from user's current role_id (DB value, not stale token claim)
     permissions: Dict[str, Dict[str, bool]] = {}
-    if role and role.permissions:
-        # Ensure proper type
-        permissions = role.permissions  # type: ignore[assignment]
+    if user.role_id:
+        role_stmt = select(Role).where(Role.id == user.role_id, Role.tenant_id == tenant_id)
+        role_result = await db.execute(role_stmt)
+        role = role_result.scalar_one_or_none()
+        if role and role.permissions:
+            permissions = role.permissions  # type: ignore[assignment]
 
     return CurrentUser(
         id=user.id,

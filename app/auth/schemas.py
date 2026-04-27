@@ -148,3 +148,18 @@ class CurrentUser(BaseModel):
     academic_year_id: Optional[UUID] = None  # ACTIVE academic year (is_current=true) at login
     academic_year_status: Optional[str] = None  # ACTIVE | CLOSED; CLOSED => read-only
 
+
+class MeResponse(BaseModel):
+    """Fresh-from-DB identity and access check. Use this instead of decoding the JWT on the client."""
+
+    id: UUID
+    full_name: str
+    email: str
+    role: str
+    user_type: Optional[str] = None
+    status: str
+    tenant: TenantInfo
+    modules: List[str]
+    permissions: Dict[str, Dict[str, bool]]
+    academic_year: Optional[AcademicYearContext] = None
+

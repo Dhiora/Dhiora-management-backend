@@ -146,7 +146,7 @@ async def login_user(db: AsyncSession, payload: LoginRequest) -> LoginResponse:
     # 1. Find user by email (case-insensitive)
     user_stmt = select(User).where(func.lower(User.email) == func.lower(payload.email))
     user_result = await db.execute(user_stmt)
-    user: Optional[User] = user_result.scalar_one_or_none()
+    user: Optional[User] = user_result.scalars().first()
     if not user:
         raise ServiceError("Invalid credentials", status.HTTP_401_UNAUTHORIZED)
 

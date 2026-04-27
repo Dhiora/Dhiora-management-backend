@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     jwt_algorithm: str = Field("HS256", alias="JWT_ALGORITHM")
     access_token_expire_minutes: int = Field(15, alias="ACCESS_TOKEN_EXPIRE_MINUTES")
     refresh_token_expire_days: int = Field(7, alias="REFRESH_TOKEN_EXPIRE_DAYS")
+    parent_jwt_expiry_minutes: int = Field(60, alias="PARENT_JWT_EXPIRY_MINUTES")
+    parent_invite_token_expiry_hours: int = Field(48, alias="PARENT_INVITE_TOKEN_EXPIRY_HOURS")
 
     platform_admin_email: Optional[str] = Field(None, alias="PLATFORM_ADMIN_EMAIL")
     platform_admin_password: Optional[str] = Field(None, alias="PLATFORM_ADMIN_PASSWORD")
@@ -38,6 +40,10 @@ class Settings(BaseSettings):
 
     razorpay_key_id: Optional[str] = Field(None, alias="RAZORPAY_KEY_ID")
     razorpay_key_secret: Optional[str] = Field(None, alias="RAZORPAY_KEY_SECRET")
+    gradebook_enabled: bool = Field(False, alias="GRADEBOOK_ENABLED")
+    parent_portal_enabled: bool = Field(True, alias="PARENT_PORTAL_ENABLED")
+    sms_gateway: Optional[str] = Field(None, alias="SMS_GATEWAY")
+    sms_api_key: Optional[str] = Field(None, alias="SMS_API_KEY")
 
     # AWS S3 — board image storage
     aws_access_key_id: Optional[str] = Field(None, alias="AWS_ACCESS_KEY_ID")

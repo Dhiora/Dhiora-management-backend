@@ -45,6 +45,8 @@ class User(Base):
     role = Column(String(50), nullable=False)
     # FK to auth.roles for employees/students; null for legacy admin users
     role_id = Column(UUID(as_uuid=True), ForeignKey("auth.roles.id"), nullable=True)
+    # Nullable link for parent users (set when role/user_type is parent)
+    parent_id = Column(UUID(as_uuid=True), ForeignKey("school.parents.id"), nullable=True)
     status = Column(String(20), nullable=False, default="ACTIVE")
     # Origin: SYSTEM, EMPLOYEE, STUDENT, PARENT
     source = Column(String(50), nullable=False, default="SYSTEM")

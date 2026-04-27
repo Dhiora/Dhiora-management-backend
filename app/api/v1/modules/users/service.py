@@ -133,11 +133,20 @@ async def _get_role_for_student(db: AsyncSession, tenant_id: UUID, role_id: Opti
 
 
 async def _check_duplicate_email(db: AsyncSession, tenant_id: UUID, email: str, exclude_user_id: Optional[UUID] = None) -> bool:
-    stmt = select(User).where(User.tenant_id == tenant_id, User.email == email)
+    stmt = select(User).where(User.tenant_id == tenant_id, func.lower(User.email) == func.lower(email))
     if exclude_user_id is not None:
         stmt = stmt.where(User.id != exclude_user_id)
     result = await db.execute(stmt)
-    return result.scalar_one_or_none() is not None
+    return result.scalars().first() is not None
+
+
+async def _check_email_exists_globally(db: AsyncSession, email: str, exclude_user_id: Optional[UUID] = None) -> bool:
+    """Check if email exists across ALL tenants (prevents login ambiguity)."""
+    stmt = select(User).where(func.lower(User.email) == func.lower(email))
+    if exclude_user_id is not None:
+        stmt = stmt.where(User.id != exclude_user_id)
+    result = await db.execute(stmt)
+    return result.scalars().first() is not None
 
 
 async def _check_duplicate_mobile(db: AsyncSession, tenant_id: UUID, mobile: str, exclude_user_id: Optional[UUID] = None) -> bool:
@@ -147,7 +156,7 @@ async def _check_duplicate_mobile(db: AsyncSession, tenant_id: UUID, mobile: str
     if exclude_user_id is not None:
         stmt = stmt.where(User.id != exclude_user_id)
     result = await db.execute(stmt)
-    return result.scalar_one_or_none() is not None
+    return result.scalars().first() is not None
 
 
 def _fallback_org_code() -> str:
@@ -277,8 +286,8 @@ async def create_employee(
     if not dept:
         raise ServiceError("Invalid department", status.HTTP_400_BAD_REQUEST)
 
-    if await _check_duplicate_email(db, tenant_id, payload.email):
-        raise ServiceError("Email already exists for this tenant", status.HTTP_409_CONFLICT)
+    if await _check_email_exists_globally(db, payload.email):
+        raise ServiceError("Email already exists", status.HTTP_409_CONFLICT)
     if payload.mobile and await _check_duplicate_mobile(db, tenant_id, payload.mobile):
         raise ServiceError("Mobile number already exists for this tenant", status.HTTP_409_CONFLICT)
 
@@ -471,8 +480,8 @@ async def create_student(
     if section.class_id != payload.class_id:
         raise ServiceError("Section does not belong to the selected class", status.HTTP_400_BAD_REQUEST)
 
-    if await _check_duplicate_email(db, tenant_id, payload.email):
-        raise ServiceError("Email already exists for this tenant", status.HTTP_409_CONFLICT)
+    if await _check_email_exists_globally(db, payload.email):
+        raise ServiceError("Email already exists", status.HTTP_409_CONFLICT)
     if payload.mobile and await _check_duplicate_mobile(db, tenant_id, payload.mobile):
         raise ServiceError("Mobile number already exists for this tenant", status.HTTP_409_CONFLICT)
 
@@ -921,8 +930,8 @@ async def create_students_bulk_with_failures(
         if getattr(section, "class_id", None) != item.class_id:
             failed.append((rd, "Section does not belong to the given class"))
             continue
-        if await _check_duplicate_email(db, tenant_id, item.email):
-            failed.append((rd, f"Email already exists for this tenant: {item.email}"))
+        if await _check_email_exists_globally(db, item.email):
+            failed.append((rd, f"Email already exists: {item.email}"))
             continue
         if item.mobile and await _check_duplicate_mobile(db, tenant_id, item.mobile):
             failed.append((rd, f"Mobile number already exists for this tenant: {item.mobile}"))

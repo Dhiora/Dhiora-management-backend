@@ -593,6 +593,16 @@ async def mark_daily_attendance(
         )
     )
     record_rows = records_result.scalars().all()
+    absent_student_ids = [r.student_id for r in record_rows if r.status == "ABSENT"]
+    if absent_student_ids:
+        # Notification failures should not block attendance API response.
+        try:
+            from app.api.v1.parent_portal.service import dispatch_absent_notification
+
+            for student_id in absent_student_ids:
+                await dispatch_absent_notification(db, tenant_id, student_id, payload.attendance_date)
+        except Exception:
+            pass
     record_responses = []
     for r in record_rows:
         u = await db.get(User, r.student_id)

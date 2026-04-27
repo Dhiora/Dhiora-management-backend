@@ -41,6 +41,12 @@ from app.api.v1.stationary.router import router as stationary_router
 from app.api.v1.super_admin.router import router as super_admin_router
 from app.api.v1.public.router import router as public_router
 from app.api.v1.platform_leads.router import router as platform_leads_router
+from app.api.v1.grades.router import router as grades_router
+from app.api.v1.parent_portal import models as parent_portal_models  # noqa: F401
+from app.api.v1.parent_portal.admin_router import router as parent_admin_router
+from app.api.v1.parent_portal.auth_router import router as parent_auth_router
+from app.api.v1.parent_portal.parent_router import router as parent_router
+from app.core.config import settings
 from modules.payroll import models as payroll_models  # noqa: F401 - register payroll tables with SQLAlchemy
 from modules.payroll.router import router as payroll_router
 
@@ -84,6 +90,7 @@ def create_app() -> FastAPI:
     app.include_router(teacher_subject_assignments_router)
     app.include_router(class_teachers_router)
     app.include_router(exam_router)
+    app.include_router(grades_router)
     app.include_router(fee_components_router)
     app.include_router(fees_router)
     app.include_router(transport_router)
@@ -99,6 +106,10 @@ def create_app() -> FastAPI:
     app.include_router(public_router)
     app.include_router(platform_leads_router)
     app.include_router(test_router)
+    if settings.parent_portal_enabled:
+        app.include_router(parent_auth_router)
+        app.include_router(parent_router)
+        app.include_router(parent_admin_router)
 
     return app
 

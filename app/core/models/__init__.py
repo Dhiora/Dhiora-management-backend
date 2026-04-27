@@ -77,6 +77,7 @@ from app.core.models.ai_token_usage import AITokenUsage
 from app.core.models.ai_whisper_usage import AIWhisperUsage
 from app.core.models.school_profile import SchoolProfile
 from app.core.models.lead import Lead
+from app.api.v1.grades.models import ExamMark, GradeScale
 
 __all__ = [
     "AcademicYear",
@@ -156,5 +157,7 @@ __all__ = [
     "AIWhisperUsage",
     "SchoolProfile",
     "Lead",
+    "ExamMark",
+    "GradeScale",
 ]
 
